@@ -1,0 +1,7 @@
+# GLMakie は PrecompileTools のワークロードで実際に OpenGL ウィンドウを開くため、
+# ヘッドレス環境（CI）では precompile 自体が失敗する。
+# SPHAdjoint 本体は GLMakie を使わないが、[deps] にある以上 SPHAdjoint を
+# precompile するには GLMakie の precompile が必要になるため避けられない。
+# PrecompileTools のワークロードだけ止める（本来の解決は issue #13）。
+[GLMakie]
+precompile_workload = false

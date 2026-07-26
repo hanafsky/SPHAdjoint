@@ -1,5 +1,7 @@
 # SPHAdjoint.jl
 
+[![CI](https://github.com/hanafsky/SPHAdjoint/actions/workflows/CI.yml/badge.svg)](https://github.com/hanafsky/SPHAdjoint/actions/workflows/CI.yml)
+
 Julia + KernelAbstractions.jl による **微分可能 2D WCSPH**。
 diffSPH (Winchenbach & Thuerey, JCP 2026) がやっていることを、
 Apple Silicon / Metal で走る形に置き換えるための最初の一歩。
