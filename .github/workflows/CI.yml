@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+
+# 同じブランチへの連続 push では古い実行を打ち切る
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS ランナーを使う理由: Project.toml の [deps] に macOS 専用の Metal が
+        # 入っているため、Linux では instantiate が通らない。
+        # テスト自体は CPU + Float64 のみで GPU は要らない（GitHub のランナーには
+        # Metal デバイスが無いので、Metal を使う検証はローカル実行のままにする）。
+        os: [macos-latest]
+        # Project.toml の compat 下限 (1.10) と開発中のバージョン (1.12) を見る
+        version: ['1.10', '1.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          arch: aarch64
+
+      - uses: julia-actions/cache@v2
+
+      - uses: julia-actions/julia-buildpkg@v1
+
+      - uses: julia-actions/julia-runtest@v1
