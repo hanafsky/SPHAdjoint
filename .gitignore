@@ -1,0 +1,21 @@
+Manifest.toml
+/notebooks/*.md
+/notebooks/*.ipynb
+!/notebooks/.gitkeep
+
+# スクリプトの出力
+*.csv
+*.vtu
+*.vtk
+*.png
+*.mp4
+
+# Python 検証ハーネス
+tools/__pycache__/
+*.pyc
+
+.DS_Store
+.vscode/
+.idea/
+*.cov
+/docs/build/
