@@ -17,6 +17,16 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # GLMakie は precompile 時に PrecompileTools のワークロードで OpenGL
+      # ウィンドウを開こうとし、ヘッドレスの CI では
+      #   GLFWError (FORMAT_UNAVAILABLE): NSGL: Failed to find a suitable pixel format
+      # で落ちる。テストは GLMakie も Metal も using しないので、自動 precompile
+      # を切って「実際に読み込むものだけコンパイルする」ようにする。
+      #
+      # これは対症療法。本来 Metal と GLMakie はオプショナルな依存であり、
+      # [deps] から外すのが筋（issue #13）。
+      JULIA_PKG_PRECOMPILE_AUTO: '0'
     strategy:
       fail-fast: false
       matrix:
