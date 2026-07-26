@@ -18,11 +18,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
-      # GLMakie は precompile 時に PrecompileTools のワークロードで OpenGL
-      # ウィンドウを開こうとし、ヘッドレスの CI では
+      # GLMakie は precompile 時に PrecompileTools のワークロードで実際に OpenGL
+      # ウィンドウを開くため、ヘッドレスの CI では precompile 自体が失敗する:
       #   GLFWError (FORMAT_UNAVAILABLE): NSGL: Failed to find a suitable pixel format
-      # で落ちる。テストは GLMakie も Metal も using しないので、自動 precompile
-      # を切って「実際に読み込むものだけコンパイルする」ようにする。
+      # テストは GLMakie も Metal も using しないので、Pkg の自動 precompile を
+      # 切って「実際に読み込むものだけコンパイルする」ようにする。
       #
       # これは対症療法。本来 Metal と GLMakie はオプショナルな依存であり、
       # [deps] から外すのが筋（issue #13）。
@@ -50,4 +50,13 @@ jobs:
 
       - uses: julia-actions/julia-buildpkg@v1
 
-      - uses: julia-actions/julia-runtest@v1
+      # julia-actions/julia-runtest（= Pkg.test()）は使わない。
+      # Pkg.test() はサンドボックスの**直接依存を必ず precompile する**ので、
+      # JULIA_PKG_PRECOMPILE_AUTO=0 でも GLMakie の precompile が走って落ちる。
+      # プロジェクト環境で runtests.jl を直接読めば、実際に using するものしか
+      # コンパイルされない（Test / Random は @stdlib から解決されるので
+      # [extras] のままで足りる）。
+      - name: Run tests
+        run: |
+          julia --project=. --color=yes --check-bounds=yes -e '
+            include("test/runtests.jl")'
