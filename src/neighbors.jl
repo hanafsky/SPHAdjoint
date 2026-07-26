@@ -34,14 +34,14 @@ end
     return Int32(cx + (cy - 1) * nx)
 end
 
-@kernel function _cl_assign!(cellof, counts, @Const(X), cs, nx, ny)
+@kernel inbounds = true function _cl_assign!(cellof, counts, @Const(X), cs, nx, ny)
     i = @index(Global)
     c = cell_index(X[1, i], X[2, i], cs, nx, ny)
     cellof[i] = c
     Atomix.@atomic counts[c] += Int32(1)
 end
 
-@kernel function _cl_fill!(order, cursor, @Const(cellof))
+@kernel inbounds = true function _cl_fill!(order, cursor, @Const(cellof))
     i = @index(Global)
     c = cellof[i]
     # Atomix の @atomic x += v は「新しい値」を返す。cursor は排他的オフセットで
@@ -50,11 +50,24 @@ end
     order[pos] = Int32(i)
 end
 
+"""
+    build!(cl, X, p, backend)
+
+セルリストを組み直す。
+
+!!! note "同期しない"
+    ここでは `synchronize` を呼ばない。同一 backend のカーネルと配列演算は
+    同じキューに順序どおり積まれるので、ホストが結果を読むまで同期は不要
+    （`Array()` / ホストへの `copyto!` 自体が同期点になる）。CPU backend は
+    そもそも同期実行で `synchronize(::CPU)` は no-op。
+
+    カーネルごとに同期していた版に比べ、Metal では 1 ステップあたりの
+    往復レイテンシが消えて **N=925 で 7.3 倍**速い（`scripts/05_metal_bench.jl`）。
+"""
 function build!(cl::CellList, X, p::SPHParams{T}, backend) where {T}
     N = size(X, 2)
     fill!(cl.counts, Int32(0))
     _cl_assign!(backend)(cl.cellof, cl.counts, X, T(cl.cs), cl.nx, cl.ny; ndrange = N)
-    KernelAbstractions.synchronize(backend)
 
     # 排他的プレフィックス和。GPUArrays が accumulate! を提供していない
     # バックエンドでは、この 3 行を CPU 往復に差し替えればよい（ncell は小さい）。
@@ -63,6 +76,5 @@ function build!(cl::CellList, X, p::SPHParams{T}, backend) where {T}
     cl.cursor .= cl.starts
 
     _cl_fill!(backend)(cl.order, cl.cursor, cl.cellof; ndrange = N)
-    KernelAbstractions.synchronize(backend)
     return cl
 end

@@ -19,7 +19,7 @@ backend = CPU()                       # Metal なら MetalBackend()
 p  = SPHParams{Float64}(h=0.03, m=9e-4, rho0=1.0, c=15.0, mu=0.02,
                         dt=2e-4, Lx=1.0, Ly=1.0, kw=2e4, ngx=17, ngy=17)
 st = State(backend, X0, V0, p)
-tape = Tuple{typeof(st.X),typeof(st.V)}[]
+tape = Tape(backend, size(X0, 2), 500, p)   # (2, N, 500) を一度だけ確保
 simulate!(st, theta, p, backend, 500; tape)
 J, seed = target_objective(st.X, 0.8, 0.15, 0.08)
 ws = AdjointWorkspace(backend, size(st.X,2), p)
@@ -36,8 +36,8 @@ module SPHAdjoint
 using KernelAbstractions
 using Atomix
 
-export SPHParams, State, CellList, AdjointWorkspace
-export simulate!, step!, build!, backward!, target_objective
+export SPHParams, State, CellList, AdjointWorkspace, Tape
+export simulate!, step!, build!, backward!, target_objective, reset!
 
 include("kernels.jl")
 include("params.jl")
