@@ -24,8 +24,12 @@
 # ここだけ Atomix のアトミック加算を使う。
 # ---------------------------------------------------------------------------
 
-@kernel function adj_pass1_kernel!(gX, gV, grho, galpha,
-                                   @Const(abar), @Const(X), @Const(V), @Const(rho),
+# 前進側と同じチューニングを適用してある（inbounds / r² 早期棄却 / 除算の前計算 /
+# Int32 セル走査。詳細は src/forward.jl 冒頭のコメントと scripts/07_kernel_tuning.jl）。
+# pterm = p/ρ², invrho = 1/ρ は前進と同じ eos_kernel! で作る。
+@kernel inbounds = true function adj_pass1_kernel!(gX, gV, grho, galpha,
+                                   @Const(abar), @Const(X), @Const(V),
+                                   @Const(pterm), @Const(invrho),
                                    @Const(theta), @Const(starts), @Const(counts),
                                    @Const(order), p, cs, nx, ny)
     i = @index(Global)
@@ -34,81 +38,89 @@
     A = wnorm(h)
     mass = p.m
     c2 = p.c^2
+    invh = one(T) / h
+    invcs = one(T) / T(cs)
+    r2max = T(4) * h * h
+    r2min = eps(T) * h * h
+    Fc = -5 * A * invh * invh              # f_kern(q) = Fc·u³
+    Gc = T(7.5) * A * invh * invh          # g_kern(q) = Gc·u²
+    twomumass = 2 * mass * p.mu
+    nx32 = Int32(nx)
+    ny32 = Int32(ny)
 
     xi = X[1, i]; yi = X[2, i]
     vxi = V[1, i]; vyi = V[2, i]
     abx = abar[1, i]; aby = abar[2, i]
-    rhoi = rho[i]
-    pi_ = c2 * (rhoi - p.rho0)
+    pti = pterm[i]
+    iri = invrho[i]
 
-    cx = clamp(unsafe_trunc(Int, floor(xi / T(cs))) + 2, 1, nx)
-    cy = clamp(unsafe_trunc(Int, floor(yi / T(cs))) + 2, 1, ny)
+    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
+    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
 
     gx = zero(T); gy = zero(T)
     gvx = zero(T); gvy = zero(T)
     grh = zero(T)
     sumS = zero(T)
 
-    for ddy in -1:1, ddx in -1:1
+    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
         jx = cx + ddx
         jy = cy + ddy
-        if 1 <= jx <= nx && 1 <= jy <= ny
-            cc = jx + (jy - 1) * nx
+        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
+            cc = jx + (jy - Int32(1)) * nx32
             s = starts[cc]
             n = counts[cc]
-            for k in 1:n
+            for k in Int32(1):n
                 j = order[s+k]
-                j == i && continue
                 dx = xi - X[1, j]
                 dy = yi - X[2, j]
                 r2 = dx * dx + dy * dy
-                r2 < eps(T) * h * h && continue
-                r = sqrt(r2)
-                q = r / h
-                q >= T(2) && continue
-                F = f_kern(q, A, h)
-                G = g_kern(q, A, h)
+                if r2min < r2 < r2max
+                    r = sqrt(r2)
+                    q = r * invh
+                    u = one(T) - T(0.5) * q
+                    F = Fc * u * u * u
+                    G = Gc * u * u
 
-                rhoj = rho[j]
-                pj = c2 * (rhoj - p.rho0)
-                Pij = mass * (pi_ / rhoi^2 + pj / rhoj^2)
-                Cbase = 2 * mass * p.mu / (rhoi * rhoj)
-                C = Cbase * F
+                    Pij = mass * (pti + pterm[j])
+                    Cbase = twomumass * iri * invrho[j]
+                    C = Cbase * F
 
-                dax = abx - abar[1, j]
-                day = aby - abar[2, j]
-                dvx = vxi - V[1, j]
-                dvy = vyi - V[2, j]
+                    dax = abx - abar[1, j]
+                    day = aby - abar[2, j]
+                    dvx = vxi - V[1, j]
+                    dvy = vyi - V[2, j]
 
-                ad_d = -(dax * dx + day * dy)      # (ā_j - ā_i)·d_ij
-                ad_v = dax * dvx + day * dvy       # (ā_i - ā_j)·(v_i - v_j)
+                    ad_d = -(dax * dx + day * dy)  # (ā_j - ā_i)·d_ij
+                    ad_v = dax * dvx + day * dvy   # (ā_i - ā_j)·(v_i - v_j)
 
-                # 圧力項の d_ij 経由（i 側と j 側をまとめて）
-                gx -= Pij * F * dax
-                gy -= Pij * F * day
+                    # 圧力項の d_ij 経由（i 側と j 側をまとめて）
+                    gx -= Pij * F * dax
+                    gy -= Pij * F * day
 
-                # F_ij 経由: ∂F/∂x_i = G(q) d_ij/(h r)
-                Fbar = Pij * ad_d + Cbase * ad_v
-                w = Fbar * G / (h * r)
-                gx += w * dx
-                gy += w * dy
+                    # F_ij 経由: ∂F/∂x_i = G(q) d_ij/(h r)
+                    Fbar = Pij * ad_d + Cbase * ad_v
+                    w = Fbar * G * invh / r
+                    gx += w * dx
+                    gy += w * dy
 
-                # 粘性項の速度依存
-                gvx += C * dax
-                gvy += C * day
+                    # 粘性項の速度依存
+                    gvx += C * dax
+                    gvy += C * day
 
-                # 粘性項の ρ_i 依存
-                grh -= C * ad_v / rhoi
+                    # 粘性項の ρ_i 依存
+                    grh -= C * ad_v * iri
 
-                # 圧力項の P_ij 経由（p̄ と ρ̄ にあとでまとめて配る）
-                sumS += F * ad_d
+                    # 圧力項の P_ij 経由（p̄ と ρ̄ にあとでまとめて配る）
+                    sumS += F * ad_d
+                end
             end
         end
     end
 
     # P_ij = m(p_i/ρ_i² + p_j/ρ_j²) 経由の ρ̄ と、p = c²(ρ-ρ0) 経由の ρ̄
-    grh += (-2 * mass * pi_ / rhoi^3) * sumS
-    grh += c2 * (mass / rhoi^2) * sumS
+    #   pi_/ρ_i³ = pterm_i·(1/ρ_i),  1/ρ_i² = (1/ρ_i)²
+    grh += (-2 * mass * pti * iri) * sumS
+    grh += c2 * mass * iri * iri * sumS
 
     # Brinkman 抗力
     alpha, _, _ = interp_alpha(theta, xi, yi, p)
@@ -129,38 +141,47 @@ end
 
 # 密度総和の随伴:  ∂ρ_i/∂x_i = Σ_j m F_ij d_ij,  ∂ρ_j/∂x_i = m F_ij d_ij
 #   ⇒ x̄_i += Σ_j m F_ij d_ij (ρ̄_i + ρ̄_j)      （完全に gather）
-@kernel function adj_pass2_kernel!(gX, @Const(grho), @Const(X), @Const(starts),
-                                   @Const(counts), @Const(order), h, mass, cs, nx, ny)
+@kernel inbounds = true function adj_pass2_kernel!(gX, @Const(grho), @Const(X),
+                                   @Const(starts), @Const(counts), @Const(order),
+                                   h, mass, cs, nx, ny)
     i = @index(Global)
     T = eltype(gX)
     A = wnorm(T(h))
+    invh = one(T) / T(h)
+    invcs = one(T) / T(cs)
+    r2max = T(4) * T(h) * T(h)
+    r2min = eps(T) * T(h) * T(h)
+    Fc = -5 * A * invh * invh
+    nx32 = Int32(nx)
+    ny32 = Int32(ny)
     xi = X[1, i]; yi = X[2, i]
     gri = grho[i]
 
-    cx = clamp(unsafe_trunc(Int, floor(xi / T(cs))) + 2, 1, nx)
-    cy = clamp(unsafe_trunc(Int, floor(yi / T(cs))) + 2, 1, ny)
+    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
+    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
 
     gx = zero(T); gy = zero(T)
-    for ddy in -1:1, ddx in -1:1
+    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
         jx = cx + ddx
         jy = cy + ddy
-        if 1 <= jx <= nx && 1 <= jy <= ny
-            cc = jx + (jy - 1) * nx
+        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
+            cc = jx + (jy - Int32(1)) * nx32
             s = starts[cc]
             n = counts[cc]
-            for k in 1:n
+            for k in Int32(1):n
                 j = order[s+k]
-                j == i && continue
                 dx = xi - X[1, j]
                 dy = yi - X[2, j]
                 r2 = dx * dx + dy * dy
-                r2 < eps(T) * h * h && continue
-                r = sqrt(r2)
-                q = r / T(h)
-                q >= T(2) && continue
-                w = T(mass) * f_kern(q, A, T(h)) * (gri + grho[j])
-                gx += w * dx
-                gy += w * dy
+                if r2min < r2 < r2max
+                    # sqrt だけ fastmath（理由は forward.jl の density_kernel! を参照。
+                    # このカーネルは density と同じ sqrt+多項式構造なので同様に効く）
+                    q = (@fastmath sqrt(r2)) * invh
+                    u = one(T) - T(0.5) * q
+                    w = T(mass) * (Fc * u * u * u) * (gri + grho[j])
+                    gx += w * dx
+                    gy += w * dy
+                end
             end
         end
     end
@@ -169,7 +190,7 @@ end
 end
 
 # 設計変数場への書き戻し。ここだけ scatter なのでアトミックを使う。
-@kernel function adj_design_kernel!(gtheta, gX, @Const(galpha), @Const(X),
+@kernel inbounds = true function adj_design_kernel!(gtheta, gX, @Const(galpha), @Const(X),
                                     @Const(theta), p)
     i = @index(Global)
     T = eltype(gX)
@@ -190,19 +211,19 @@ end
     Atomix.@atomic gtheta[l00+ny+1] += ga * fx * fy
 end
 
-@kernel function _axpy2!(dst, @Const(src))
+@kernel inbounds = true function _axpy2!(dst, @Const(src))
     i = @index(Global)
     dst[1, i] += src[1, i]
     dst[2, i] += src[2, i]
 end
 
-@kernel function _adj_integrate!(gV, @Const(gX), dt)
+@kernel inbounds = true function _adj_integrate!(gV, @Const(gX), dt)
     i = @index(Global)
     gV[1, i] += dt * gX[1, i]
     gV[2, i] += dt * gX[2, i]
 end
 
-@kernel function _scale2!(dst, @Const(src), s)
+@kernel inbounds = true function _scale2!(dst, @Const(src), s)
     i = @index(Global)
     dst[1, i] = s * src[1, i]
     dst[2, i] = s * src[2, i]

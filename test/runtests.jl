@@ -100,7 +100,7 @@ end
         st = State(backend, X0, V0, p)
         th = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
         copyto!(th, theta)
-        tape = want_tape ? Tuple{typeof(st.X),typeof(st.V)}[] : nothing
+        tape = want_tape ? Tape(backend, N, nsteps, p) : nothing
         simulate!(st, th, p, backend, nsteps; tape)
         J = sum(Array(st.X) .* cX) + sum(Array(st.V) .* cV)
         return J, st, th, tape

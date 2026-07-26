@@ -17,7 +17,10 @@
 @inline function w_kern(q::T, A::T) where {T}
     if q < T(2)
         u = one(T) - q / 2
-        return A * u^4 * (2q + one(T))
+        u2 = u * u
+        # u^4 と書かない: Float^Int は補正付き pow_body に落ちて乗算 2 回より
+        # 2 倍以上遅い（^2, ^3 は乗算に展開されるので無害）
+        return A * u2 * u2 * (2q + one(T))
     end
     return zero(T)
 end
