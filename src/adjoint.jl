@@ -30,8 +30,8 @@
 @kernel inbounds = true function adj_pass1_kernel!(gX, gV, grho, galpha,
                                    @Const(abar), @Const(X), @Const(V),
                                    @Const(pterm), @Const(invrho),
-                                   @Const(theta), @Const(starts), @Const(counts),
-                                   @Const(order), p, cs, nx, ny)
+                                   @Const(theta), @Const(nbcount), @Const(indices),
+                                   p, N)
     i = @index(Global)
     T = eltype(gX)
     h = p.h
@@ -39,14 +39,11 @@
     mass = p.m
     c2 = p.c^2
     invh = one(T) / h
-    invcs = one(T) / T(cs)
     r2max = T(4) * h * h
-    r2min = eps(T) * h * h
     Fc = -5 * A * invh * invh              # f_kern(q) = Fc·u³
     Gc = T(7.5) * A * invh * invh          # g_kern(q) = Gc·u²
     twomumass = 2 * mass * p.mu
-    nx32 = Int32(nx)
-    ny32 = Int32(ny)
+    N32 = Int32(N)
 
     xi = X[1, i]; yi = X[2, i]
     vxi = V[1, i]; vyi = V[2, i]
@@ -54,66 +51,54 @@
     pti = pterm[i]
     iri = invrho[i]
 
-    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
-    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
-
     gx = zero(T); gy = zero(T)
     gvx = zero(T); gvy = zero(T)
     grh = zero(T)
     sumS = zero(T)
 
-    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
-        jx = cx + ddx
-        jy = cy + ddy
-        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
-            cc = jx + (jy - Int32(1)) * nx32
-            s = starts[cc]
-            n = counts[cc]
-            for k in Int32(1):n
-                j = order[s+k]
-                dx = xi - X[1, j]
-                dy = yi - X[2, j]
-                r2 = dx * dx + dy * dy
-                if r2min < r2 < r2max
-                    r = sqrt(r2)
-                    q = r * invh
-                    u = one(T) - T(0.5) * q
-                    F = Fc * u * u * u
-                    G = Gc * u * u
+    for m in Int32(0):(nbcount[i]-Int32(1))
+        j = indices[m*N32+Int32(i)]
+        dx = xi - X[1, j]
+        dy = yi - X[2, j]
+        r2 = dx * dx + dy * dy
+        if r2 < r2max
+            r = sqrt(r2)
+            q = r * invh
+            u = one(T) - T(0.5) * q
+            F = Fc * u * u * u
+            G = Gc * u * u
 
-                    Pij = mass * (pti + pterm[j])
-                    Cbase = twomumass * iri * invrho[j]
-                    C = Cbase * F
+            Pij = mass * (pti + pterm[j])
+            Cbase = twomumass * iri * invrho[j]
+            C = Cbase * F
 
-                    dax = abx - abar[1, j]
-                    day = aby - abar[2, j]
-                    dvx = vxi - V[1, j]
-                    dvy = vyi - V[2, j]
+            dax = abx - abar[1, j]
+            day = aby - abar[2, j]
+            dvx = vxi - V[1, j]
+            dvy = vyi - V[2, j]
 
-                    ad_d = -(dax * dx + day * dy)  # (ā_j - ā_i)·d_ij
-                    ad_v = dax * dvx + day * dvy   # (ā_i - ā_j)·(v_i - v_j)
+            ad_d = -(dax * dx + day * dy)  # (ā_j - ā_i)·d_ij
+            ad_v = dax * dvx + day * dvy   # (ā_i - ā_j)·(v_i - v_j)
 
-                    # 圧力項の d_ij 経由（i 側と j 側をまとめて）
-                    gx -= Pij * F * dax
-                    gy -= Pij * F * day
+            # 圧力項の d_ij 経由（i 側と j 側をまとめて）
+            gx -= Pij * F * dax
+            gy -= Pij * F * day
 
-                    # F_ij 経由: ∂F/∂x_i = G(q) d_ij/(h r)
-                    Fbar = Pij * ad_d + Cbase * ad_v
-                    w = Fbar * G * invh / r
-                    gx += w * dx
-                    gy += w * dy
+            # F_ij 経由: ∂F/∂x_i = G(q) d_ij/(h r)
+            Fbar = Pij * ad_d + Cbase * ad_v
+            w = Fbar * G * invh / r
+            gx += w * dx
+            gy += w * dy
 
-                    # 粘性項の速度依存
-                    gvx += C * dax
-                    gvy += C * day
+            # 粘性項の速度依存
+            gvx += C * dax
+            gvy += C * day
 
-                    # 粘性項の ρ_i 依存
-                    grh -= C * ad_v * iri
+            # 粘性項の ρ_i 依存
+            grh -= C * ad_v * iri
 
-                    # 圧力項の P_ij 経由（p̄ と ρ̄ にあとでまとめて配る）
-                    sumS += F * ad_d
-                end
-            end
+            # 圧力項の P_ij 経由（p̄ と ρ̄ にあとでまとめて配る）
+            sumS += F * ad_d
         end
     end
 
@@ -142,47 +127,31 @@ end
 # 密度総和の随伴:  ∂ρ_i/∂x_i = Σ_j m F_ij d_ij,  ∂ρ_j/∂x_i = m F_ij d_ij
 #   ⇒ x̄_i += Σ_j m F_ij d_ij (ρ̄_i + ρ̄_j)      （完全に gather）
 @kernel inbounds = true function adj_pass2_kernel!(gX, @Const(grho), @Const(X),
-                                   @Const(starts), @Const(counts), @Const(order),
-                                   h, mass, cs, nx, ny)
+                                   @Const(nbcount), @Const(indices), h, mass, N)
     i = @index(Global)
     T = eltype(gX)
     A = wnorm(T(h))
     invh = one(T) / T(h)
-    invcs = one(T) / T(cs)
     r2max = T(4) * T(h) * T(h)
-    r2min = eps(T) * T(h) * T(h)
     Fc = -5 * A * invh * invh
-    nx32 = Int32(nx)
-    ny32 = Int32(ny)
+    N32 = Int32(N)
     xi = X[1, i]; yi = X[2, i]
     gri = grho[i]
 
-    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
-    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
-
     gx = zero(T); gy = zero(T)
-    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
-        jx = cx + ddx
-        jy = cy + ddy
-        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
-            cc = jx + (jy - Int32(1)) * nx32
-            s = starts[cc]
-            n = counts[cc]
-            for k in Int32(1):n
-                j = order[s+k]
-                dx = xi - X[1, j]
-                dy = yi - X[2, j]
-                r2 = dx * dx + dy * dy
-                if r2min < r2 < r2max
-                    # sqrt だけ fastmath（理由は forward.jl の density_kernel! を参照。
-                    # このカーネルは density と同じ sqrt+多項式構造なので同様に効く）
-                    q = (@fastmath sqrt(r2)) * invh
-                    u = one(T) - T(0.5) * q
-                    w = T(mass) * (Fc * u * u * u) * (gri + grho[j])
-                    gx += w * dx
-                    gy += w * dy
-                end
-            end
+    for m in Int32(0):(nbcount[i]-Int32(1))
+        j = indices[m*N32+Int32(i)]
+        dx = xi - X[1, j]
+        dy = yi - X[2, j]
+        r2 = dx * dx + dy * dy
+        if r2 < r2max
+            # sqrt だけ fastmath（理由は forward.jl の density_kernel! を参照。
+            # このカーネルは density と同じ sqrt+多項式構造なので同様に効く）
+            q = (@fastmath sqrt(r2)) * invh
+            u = one(T) - T(0.5) * q
+            w = T(mass) * (Fc * u * u * u) * (gri + grho[j])
+            gx += w * dx
+            gy += w * dy
         end
     end
     gX[1, i] += gx

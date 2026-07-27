@@ -36,8 +36,8 @@ module SPHAdjoint
 using KernelAbstractions
 using Atomix
 
-export SPHParams, State, CellList, AdjointWorkspace, Tape
-export simulate!, step!, build!, backward!, target_objective, reset!
+export SPHParams, State, CellList, NeighborList, AdjointWorkspace, Tape
+export simulate!, step!, build!, build_neighbors!, backward!, target_objective, reset!
 
 include("kernels.jl")
 include("params.jl")
