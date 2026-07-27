@@ -66,7 +66,8 @@ end
     r2min = eps(T) * p.h * p.h
     ok = true
     for i in 1:N
-        got = sort([idx[(m-1)*N+i] for m in 1:nbc[i]])
+        got = sort([idx[SPHAdjoint.nl_index(Int32(m-1), Int32(i), Int32(st.nl.sm), Int32(st.nl.si))]
+                    for m in 1:nbc[i]])
         want = Int32[]
         for j in 1:N
             r2 = (Xh[1, i] - Xh[1, j])^2 + (Xh[2, i] - Xh[2, j])^2
@@ -80,7 +81,8 @@ end
 
     # 密度が総当たりと一致すること（自己項を含む）
     SPHAdjoint.density_kernel!(backend)(
-        st.rho, st.X, st.nl.counts, st.nl.indices, p.h, p.m, N; ndrange = N)
+        st.rho, st.X, st.nl.counts, st.nl.indices, p.h, p.m,
+        st.nl.sm, st.nl.si; ndrange = N)
     KernelAbstractions.synchronize(backend)
 
     A = SPHAdjoint.wnorm(p.h)
@@ -133,7 +135,8 @@ end
         nbc = Array(st.nl.counts)
         idx = Array(st.nl.indices)
         Xs = Array(st.X)
-        [Set(j for m in 1:nbc[i] for j in (idx[(m-1)*N+i],)
+        [Set(j for m in 1:nbc[i]
+             for j in (idx[SPHAdjoint.nl_index(Int32(m-1), Int32(i), Int32(st.nl.sm), Int32(st.nl.si))],)
              if (Xs[1, i] - Xs[1, j])^2 + (Xs[2, i] - Xs[2, j])^2 < r2max) for i in 1:N]
     end
     @test effective(a) == effective(b)

@@ -117,12 +117,17 @@ end
 #   相互作用集合が同一なら、計算される関数が同じなので離散随伴は厳密なまま。
 # ---------------------------------------------------------------------------
 
+"""粒子 i の m 番目（0 始まり）の近傍が入っている添字。ストライドでレイアウトを切り替える。"""
+@inline nl_index(m, i, sm, si) = m * sm + (i - Int32(1)) * si + Int32(1)
+
 mutable struct NeighborList{IA,AT}
-    indices::IA     # (N*maxnb,) Int32  粒子 i の m 番目の近傍 = indices[(m-1)*N+i]
+    indices::IA     # (N*maxnb,) Int32
     counts::IA      # (N,) Int32        粒子 i の近傍数
     flags::IA       # (2,) Int32        [1] 行溢れ, [2] 変位超過
     Xref::AT        # (2, N)            前回構築時の座標（変位チェック用）
     maxnb::Int      # 1 粒子あたりの上限
+    sm::Int         # m 方向のストライド（slot-major: N,  particle-major: 1）
+    si::Int         # i 方向のストライド（slot-major: 1,  particle-major: maxnb）
     rc::Float64     # カットオフ 2h(1+skin)
     dmax::Float64   # 許される変位 = skin·h
     interval::Int   # 再構築間隔
@@ -140,24 +145,32 @@ end
 近傍数は平均 28 / 最大 32 程度なので maxnb=64 は十分な余裕がある。
 """
 function NeighborList(backend, N::Integer, p::SPHParams{T};
-                      skin = 0.2, interval = 4, maxnb = 64) where {T}
+                      skin = 0.2, interval = 4, maxnb = 64, layout = :auto) where {T}
     rc = Float64(support(p)) * (1 + skin)
     dmax = Float64(p.h) * skin
+    if layout === :auto
+        # GPU は同じ m で全スレッドが連続アドレスを触る slot-major、
+        # CPU は 1 スレッドが 1 粒子の近傍を順に辿るので particle-major。
+        layout = backend isa CPU ? :particle : :slot
+    end
+    sm, si = layout === :slot ? (Int(N), 1) : (1, Int(maxnb))
+    layout in (:slot, :particle) || throw(ArgumentError("layout は :slot / :particle / :auto"))
     return NeighborList(KernelAbstractions.zeros(backend, Int32, N * maxnb),
                         KernelAbstractions.zeros(backend, Int32, N),
                         KernelAbstractions.zeros(backend, Int32, 2),
                         KernelAbstractions.zeros(backend, T, 2, N),
-                        Int(maxnb), rc, dmax, Int(interval), typemax(Int))
+                        Int(maxnb), sm, si, rc, dmax, Int(interval), typemax(Int))
 end
 
 @kernel inbounds = true function _nl_build!(indices, nbcount, flags, Xref,
                                             @Const(X), @Const(starts), @Const(counts),
                                             @Const(order), rc2, r2min, cs, nx, ny,
-                                            N, maxnb, dmax2, check)
+                                            maxnb, sm, si, dmax2, check)
     i = @index(Global)
     T = eltype(X)
     invcs = one(T) / T(cs)
-    nx32 = Int32(nx); ny32 = Int32(ny); N32 = Int32(N); mx = Int32(maxnb)
+    nx32 = Int32(nx); ny32 = Int32(ny); mx = Int32(maxnb)
+    sm32 = Int32(sm); si32 = Int32(si)
     xi = X[1, i]
     yi = X[2, i]
 
@@ -192,7 +205,7 @@ end
                 # 自己（と重心一致粒子）は r2min で除外。上限は skin 込みの rc。
                 if r2min < r2 < rc2
                     if m < mx
-                        indices[m*N32+Int32(i)] = j
+                        indices[nl_index(m, Int32(i), sm32, si32)] = j
                         m += Int32(1)
                     else
                         flags[1] = Int32(1)   # 溢れは黙って捨てず記録する
@@ -217,7 +230,7 @@ function build_neighbors!(nl::NeighborList, cl::CellList, X, p::SPHParams{T},
     _nl_build!(backend)(nl.indices, nl.counts, nl.flags, nl.Xref, X,
                         cl.starts, cl.counts, cl.order,
                         T(nl.rc^2), eps(T) * p.h * p.h, T(cl.cs), cl.nx, cl.ny,
-                        N, nl.maxnb, T(nl.dmax^2), check; ndrange = N)
+                        nl.maxnb, nl.sm, nl.si, T(nl.dmax^2), check; ndrange = N)
     nl.age = 0
     return nl
 end

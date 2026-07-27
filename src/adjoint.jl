@@ -31,7 +31,7 @@
                                    @Const(abar), @Const(X), @Const(V),
                                    @Const(pterm), @Const(invrho),
                                    @Const(theta), @Const(nbcount), @Const(indices),
-                                   p, N)
+                                   p, sm, si)
     i = @index(Global)
     T = eltype(gX)
     h = p.h
@@ -43,7 +43,7 @@
     Fc = -5 * A * invh * invh              # f_kern(q) = Fc·u³
     Gc = T(7.5) * A * invh * invh          # g_kern(q) = Gc·u²
     twomumass = 2 * mass * p.mu
-    N32 = Int32(N)
+    sm32 = Int32(sm); si32 = Int32(si)
 
     xi = X[1, i]; yi = X[2, i]
     vxi = V[1, i]; vyi = V[2, i]
@@ -57,7 +57,7 @@
     sumS = zero(T)
 
     for m in Int32(0):(nbcount[i]-Int32(1))
-        j = indices[m*N32+Int32(i)]
+        j = indices[nl_index(m, Int32(i), sm32, si32)]
         dx = xi - X[1, j]
         dy = yi - X[2, j]
         r2 = dx * dx + dy * dy
@@ -127,20 +127,20 @@ end
 # 密度総和の随伴:  ∂ρ_i/∂x_i = Σ_j m F_ij d_ij,  ∂ρ_j/∂x_i = m F_ij d_ij
 #   ⇒ x̄_i += Σ_j m F_ij d_ij (ρ̄_i + ρ̄_j)      （完全に gather）
 @kernel inbounds = true function adj_pass2_kernel!(gX, @Const(grho), @Const(X),
-                                   @Const(nbcount), @Const(indices), h, mass, N)
+                                   @Const(nbcount), @Const(indices), h, mass, sm, si)
     i = @index(Global)
     T = eltype(gX)
     A = wnorm(T(h))
     invh = one(T) / T(h)
     r2max = T(4) * T(h) * T(h)
     Fc = -5 * A * invh * invh
-    N32 = Int32(N)
+    sm32 = Int32(sm); si32 = Int32(si)
     xi = X[1, i]; yi = X[2, i]
     gri = grho[i]
 
     gx = zero(T); gy = zero(T)
     for m in Int32(0):(nbcount[i]-Int32(1))
-        j = indices[m*N32+Int32(i)]
+        j = indices[nl_index(m, Int32(i), sm32, si32)]
         dx = xi - X[1, j]
         dy = yi - X[2, j]
         r2 = dx * dx + dy * dy
