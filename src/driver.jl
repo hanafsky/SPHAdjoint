@@ -21,7 +21,7 @@ end
 （3×3 走査が成立するにはセル幅がカットオフ以上である必要がある）。
 """
 function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T};
-               skin = 0.2, interval = 4, maxnb = 64) where {T}
+               skin = 0.2, interval = 4, maxnb = 64, layout = :auto) where {T}
     N = size(X0, 2)
     X = KernelAbstractions.allocate(backend, T, 2, N)
     V = KernelAbstractions.allocate(backend, T, 2, N)
@@ -29,7 +29,7 @@ function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T};
     z1() = KernelAbstractions.zeros(backend, T, N)
     copyto!(X, T.(X0))
     copyto!(V, T.(V0))
-    nl = NeighborList(backend, N, p; skin, interval, maxnb)
+    nl = NeighborList(backend, N, p; skin, interval, maxnb, layout)
     cl = CellList(backend, N, p; cs = nl.rc)
     return State(X, V, a, z1(), z1(), z1(), cl, nl)
 end
@@ -139,7 +139,7 @@ end
 """
 function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, backend;
                    seedX, seedV, scratch = nothing,
-                   skin = 0.2, interval = 4, maxnb = 64) where {T}
+                   skin = 0.2, interval = 4, maxnb = 64, layout = :auto) where {T}
     N = size(ws.gX, 2)
     copyto!(ws.gX, seedX)
     copyto!(ws.gV, seedV)
@@ -150,7 +150,8 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
     # 食い違い、勾配がずれる。
     # `scratch` を渡せば毎回の確保を避けられる（最適化ループでは効く）。
     if scratch === nothing
-        scratch = State(backend, zeros(T, 2, N), zeros(T, 2, N), p; skin, interval, maxnb)
+        scratch = State(backend, zeros(T, 2, N), zeros(T, 2, N), p;
+                        skin, interval, maxnb, layout)
     end
 
     for n in length(tape):-1:1
@@ -165,7 +166,8 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
         # なり、離散随伴は厳密なまま（詳細は src/neighbors.jl 冒頭のコメント）。
         maybe_rebuild!(scratch.nl, scratch.cl, scratch.X, p, backend)
         density_kernel!(backend)(scratch.rho, scratch.X, scratch.nl.counts,
-                                 scratch.nl.indices, p.h, p.m, N; ndrange = N)
+                                 scratch.nl.indices, p.h, p.m,
+                                 scratch.nl.sm, scratch.nl.si; ndrange = N)
         eos_kernel!(backend)(scratch.pterm, scratch.invrho, scratch.rho,
                              p.c^2, p.rho0; ndrange = N)
 
@@ -178,13 +180,14 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
                                    ws.abar, scratch.X, scratch.V,
                                    scratch.pterm, scratch.invrho, theta,
                                    scratch.nl.counts, scratch.nl.indices,
-                                   p, N; ndrange = N)
+                                   p, scratch.nl.sm, scratch.nl.si; ndrange = N)
 
         adj_design_kernel!(backend)(ws.gtheta, ws.gXs, ws.galpha, scratch.X, theta, p;
                                     ndrange = N)
 
         adj_pass2_kernel!(backend)(ws.gXs, ws.grho, scratch.X, scratch.nl.counts,
-                                   scratch.nl.indices, p.h, p.m, N; ndrange = N)
+                                   scratch.nl.indices, p.h, p.m,
+                                   scratch.nl.sm, scratch.nl.si; ndrange = N)
 
         _axpy2!(backend)(ws.gX, ws.gXs; ndrange = N)
         _axpy2!(backend)(ws.gV, ws.gVs; ndrange = N)

@@ -23,19 +23,19 @@
 # ---------------------------------------------------------------------------
 
 @kernel inbounds = true function density_kernel!(rho, @Const(X), @Const(nbcount),
-                                                 @Const(indices), h, mass, N)
+                                                 @Const(indices), h, mass, sm, si)
     i = @index(Global)
     T = eltype(rho)
     A = wnorm(T(h))
     invh = one(T) / T(h)
     r2max = T(4) * T(h) * T(h)
-    N32 = Int32(N)
+    sm32 = Int32(sm); si32 = Int32(si)
     xi = X[1, i]
     yi = X[2, i]
 
     acc = zero(T)
     for m in Int32(0):(nbcount[i]-Int32(1))
-        j = indices[m*N32+Int32(i)]
+        j = indices[nl_index(m, Int32(i), sm32, si32)]
         dx = xi - X[1, j]
         dy = yi - X[2, j]
         r2 = dx * dx + dy * dy
@@ -76,7 +76,7 @@ end
 
 @kernel inbounds = true function accel_kernel!(a, @Const(X), @Const(V), @Const(pterm),
                                                @Const(invrho), @Const(theta),
-                                               @Const(nbcount), @Const(indices), p, N)
+                                               @Const(nbcount), @Const(indices), p, sm, si)
     i = @index(Global)
     T = eltype(a)
     h = p.h
@@ -86,7 +86,7 @@ end
     r2max = T(4) * h * h
     Fc = -5 * A * invh * invh          # f_kern(q) = Fc·u³
     twomumass = 2 * mass * p.mu
-    N32 = Int32(N)
+    sm32 = Int32(sm); si32 = Int32(si)
 
     xi = X[1, i]; yi = X[2, i]
     vxi = V[1, i]; vyi = V[2, i]
@@ -96,7 +96,7 @@ end
     ax = zero(T)
     ay = zero(T)
     for m in Int32(0):(nbcount[i]-Int32(1))
-        j = indices[m*N32+Int32(i)]
+        j = indices[nl_index(m, Int32(i), sm32, si32)]
         dx = xi - X[1, j]
         dy = yi - X[2, j]
         r2 = dx * dx + dy * dy
@@ -154,10 +154,10 @@ function step!(st, theta, p::SPHParams{T}, backend) where {T}
     # （判定はホスト側のカウンタだけなので同期は入らない）
     maybe_rebuild!(st.nl, st.cl, st.X, p, backend)
     density_kernel!(backend)(st.rho, st.X, st.nl.counts, st.nl.indices,
-                             p.h, p.m, N; ndrange = N)
+                             p.h, p.m, st.nl.sm, st.nl.si; ndrange = N)
     eos_kernel!(backend)(st.pterm, st.invrho, st.rho, p.c^2, p.rho0; ndrange = N)
     accel_kernel!(backend)(st.a, st.X, st.V, st.pterm, st.invrho, theta,
-                           st.nl.counts, st.nl.indices, p, N; ndrange = N)
+                           st.nl.counts, st.nl.indices, p, st.nl.sm, st.nl.si; ndrange = N)
     integrate_kernel!(backend)(st.X, st.V, st.a, p.dt; ndrange = N)
     return st
 end

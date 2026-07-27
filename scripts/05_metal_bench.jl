@@ -87,9 +87,9 @@ function check_forward(dp; nsteps = 20)
 
     ## --- 密度（順序に依らない量なので直接比べられる） ---
     for (st, be) in ((stc, cpu), (stg, gpu))
-        SPHAdjoint.density_kernel!(be)(st.rho, st.X, st.cl.starts, st.cl.counts,
-                                       st.cl.order, p.h, p.m, T(st.cl.cs),
-                                       st.cl.nx, st.cl.ny; ndrange = N)
+        build_neighbors!(st.nl, st.cl, st.X, p, be)
+        SPHAdjoint.density_kernel!(be)(st.rho, st.X, st.nl.counts, st.nl.indices,
+                                       p.h, p.m, st.nl.sm, st.nl.si; ndrange = N)
         KernelAbstractions.synchronize(be)
     end
     erho = maximum(abs, Array(stg.rho) .- Array(stc.rho)) / maximum(abs, Array(stc.rho))
