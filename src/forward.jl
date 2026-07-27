@@ -22,56 +22,46 @@
 #      セル添字演算を Int32 に落とす（N < 2^31 が前提。粒子数 20 億は当面来ない）。
 # ---------------------------------------------------------------------------
 
-@kernel inbounds = true function density_kernel!(rho, @Const(X), @Const(starts),
-                                                 @Const(counts), @Const(order),
-                                                 h, mass, cs, nx, ny)
+@kernel inbounds = true function density_kernel!(rho, @Const(X), @Const(nbcount),
+                                                 @Const(indices), h, mass, N)
     i = @index(Global)
     T = eltype(rho)
     A = wnorm(T(h))
     invh = one(T) / T(h)
-    invcs = one(T) / T(cs)
     r2max = T(4) * T(h) * T(h)
-    nx32 = Int32(nx)
-    ny32 = Int32(ny)
+    N32 = Int32(N)
     xi = X[1, i]
     yi = X[2, i]
-    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
-    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
 
     acc = zero(T)
-    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
-        jx = cx + ddx
-        jy = cy + ddy
-        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
-            c = jx + (jy - Int32(1)) * nx32
-            s = starts[c]
-            n = counts[c]
-            for k in Int32(1):n
-                j = order[s+k]
-                dx = xi - X[1, j]
-                dy = yi - X[2, j]
-                r2 = dx * dx + dy * dy
-                if r2 < r2max
-                    # q < 2 が保証されるので w_kern の分岐なし版をインライン。
-                    # ここの 2 点はどちらも実測で確認した高速化（N=60000 の density）:
-                    # ・`u^4` と書かない。Float^Int は補正付きの pow_body に落ちて
-                    #   乗算 2 回の 2.25 倍のコストになる（`^2`/`^3` は乗算に展開
-                    #   されるので無害、`^4` 以上が罠）。
-                    # ・sqrt だけ fastmath（+14%）。Metal の精密 Float32 sqrt は
-                    #   補正付き命令列、fast 版は HW 命令 1 発。誤差は数 ulp で
-                    #   GPU 非決定性の床と同水準。CPU のネイティブ fsqrt は元々
-                    #   IEEE 準拠なので CPU 側の結果は変わらない。
-                    # accel 側は gather 律速で sqrt を速くしても効かない（実測
-                    # 0.98〜1.06x）ため IEEE のままにしてある。
-                    q = (@fastmath sqrt(r2)) * invh
-                    u = one(T) - T(0.5) * q
-                    u2 = u * u
-                    acc += T(mass) * (A * u2 * u2 * (2 * q + one(T)))
-                end
-            end
+    for m in Int32(0):(nbcount[i]-Int32(1))
+        j = indices[m*N32+Int32(i)]
+        dx = xi - X[1, j]
+        dy = yi - X[2, j]
+        r2 = dx * dx + dy * dy
+        # 近傍リストは skin 込みで作ってあるので、ここで真のサポートに絞る。
+        # この判定があるおかげで、リストが上位集合でありさえすれば毎ステップ
+        # 構築した場合と厳密に同じ相互作用集合になる。
+        if r2 < r2max
+            # q < 2 が保証されるので w_kern の分岐なし版をインライン。
+            # ここの 2 点はどちらも実測で確認した高速化（N=60000 の density）:
+            # ・`u^4` と書かない。Float^Int は補正付きの pow_body に落ちて
+            #   乗算 2 回の 2.25 倍のコストになる（`^2`/`^3` は乗算に展開
+            #   されるので無害、`^4` 以上が罠）。
+            # ・sqrt だけ fastmath（+14%）。Metal の精密 Float32 sqrt は
+            #   補正付き命令列、fast 版は HW 命令 1 発。誤差は数 ulp で
+            #   GPU 非決定性の床と同水準。CPU のネイティブ fsqrt は元々
+            #   IEEE 準拠なので CPU 側の結果は変わらない。
+            # accel 側は gather 律速で sqrt を速くしても効かない（実測
+            # 0.98〜1.06x）ため IEEE のままにしてある。
+            q = (@fastmath sqrt(r2)) * invh
+            u = one(T) - T(0.5) * q
+            u2 = u * u
+            acc += T(mass) * (A * u2 * u2 * (2 * q + one(T)))
         end
     end
-    rho[i] = acc
+    # 近傍リストは自己を含まないので、自己項をここで足す
+    rho[i] = acc + T(mass) * A
 end
 
 """EOS とペアループ用の前計算。`pterm = p/ρ²`, `invrho = 1/ρ`。"""
@@ -86,62 +76,45 @@ end
 
 @kernel inbounds = true function accel_kernel!(a, @Const(X), @Const(V), @Const(pterm),
                                                @Const(invrho), @Const(theta),
-                                               @Const(starts), @Const(counts), @Const(order),
-                                               p, cs, nx, ny)
+                                               @Const(nbcount), @Const(indices), p, N)
     i = @index(Global)
     T = eltype(a)
     h = p.h
     A = wnorm(h)
     mass = p.m
     invh = one(T) / h
-    invcs = one(T) / T(cs)
     r2max = T(4) * h * h
-    r2min = eps(T) * h * h
     Fc = -5 * A * invh * invh          # f_kern(q) = Fc·u³
     twomumass = 2 * mass * p.mu
-    nx32 = Int32(nx)
-    ny32 = Int32(ny)
+    N32 = Int32(N)
 
     xi = X[1, i]; yi = X[2, i]
     vxi = V[1, i]; vyi = V[2, i]
     pti = pterm[i]
     iri = invrho[i]
 
-    cx = clamp(unsafe_trunc(Int32, floor(xi * invcs)) + Int32(2), Int32(1), nx32)
-    cy = clamp(unsafe_trunc(Int32, floor(yi * invcs)) + Int32(2), Int32(1), ny32)
-
     ax = zero(T)
     ay = zero(T)
-    for ddy in Int32(-1):Int32(1), ddx in Int32(-1):Int32(1)
-        jx = cx + ddx
-        jy = cy + ddy
-        if Int32(1) <= jx <= nx32 && Int32(1) <= jy <= ny32
-            cc = jx + (jy - Int32(1)) * nx32
-            s = starts[cc]
-            n = counts[cc]
-            for k in Int32(1):n
-                j = order[s+k]
-                dx = xi - X[1, j]
-                dy = yi - X[2, j]
-                r2 = dx * dx + dy * dy
-                # 下限は自己と重心一致粒子の除外（j == i 判定を兼ねる）、
-                # 上限がサポート境界。どちらも sqrt を計算する前に棄却する。
-                if r2min < r2 < r2max
-                    q = sqrt(r2) * invh
-                    u = one(T) - T(0.5) * q
-                    F = Fc * u * u * u
+    for m in Int32(0):(nbcount[i]-Int32(1))
+        j = indices[m*N32+Int32(i)]
+        dx = xi - X[1, j]
+        dy = yi - X[2, j]
+        r2 = dx * dx + dy * dy
+        # 自己と重心一致粒子は近傍リスト構築時に除外済み。ここはサポート境界のみ。
+        if r2 < r2max
+            q = sqrt(r2) * invh
+            u = one(T) - T(0.5) * q
+            F = Fc * u * u * u
 
-                    # 圧力（pterm = p/ρ² を前計算済み）
-                    Pij = mass * (pti + pterm[j])
-                    ax -= Pij * F * dx
-                    ay -= Pij * F * dy
+            # 圧力（pterm = p/ρ² を前計算済み）
+            Pij = mass * (pti + pterm[j])
+            ax -= Pij * F * dx
+            ay -= Pij * F * dy
 
-                    # 粘性（Morris）: F < 0 なので相対速度に対して散逸的
-                    C = twomumass * iri * invrho[j] * F
-                    ax += C * (vxi - V[1, j])
-                    ay += C * (vyi - V[2, j])
-                end
-            end
+            # 粘性（Morris）: F < 0 なので相対速度に対して散逸的
+            C = twomumass * iri * invrho[j] * F
+            ax += C * (vxi - V[1, j])
+            ay += C * (vyi - V[2, j])
         end
     end
 
@@ -177,14 +150,14 @@ semi-implicit Euler を 1 ステップ。V を先に更新し、その新しい 
 """
 function step!(st, theta, p::SPHParams{T}, backend) where {T}
     N = size(st.X, 2)
-    build!(st.cl, st.X, p, backend)
-    cs = T(st.cl.cs)
-    density_kernel!(backend)(st.rho, st.X, st.cl.starts, st.cl.counts, st.cl.order,
-                             p.h, p.m, cs, st.cl.nx, st.cl.ny; ndrange = N)
+    # 近傍リストは skin のぶんだけ余裕を持たせてあるので毎ステップは組み直さない
+    # （判定はホスト側のカウンタだけなので同期は入らない）
+    maybe_rebuild!(st.nl, st.cl, st.X, p, backend)
+    density_kernel!(backend)(st.rho, st.X, st.nl.counts, st.nl.indices,
+                             p.h, p.m, N; ndrange = N)
     eos_kernel!(backend)(st.pterm, st.invrho, st.rho, p.c^2, p.rho0; ndrange = N)
     accel_kernel!(backend)(st.a, st.X, st.V, st.pterm, st.invrho, theta,
-                           st.cl.starts, st.cl.counts, st.cl.order, p, cs,
-                           st.cl.nx, st.cl.ny; ndrange = N)
+                           st.nl.counts, st.nl.indices, p, N; ndrange = N)
     integrate_kernel!(backend)(st.X, st.V, st.a, p.dt; ndrange = N)
     return st
 end

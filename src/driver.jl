@@ -2,17 +2,26 @@
 # 前進・随伴のドライバ
 # ---------------------------------------------------------------------------
 
-mutable struct State{AT,VT,CL}
+mutable struct State{AT,VT,CL,NL}
     X::AT       # (2, N)
     V::AT
     a::AT
     rho::VT     # (N,)
     pterm::VT   # (N,)  p/ρ²（eos_kernel! の前計算。ペアループから除算を消す）
     invrho::VT  # (N,)  1/ρ
-    cl::CL
+    cl::CL      # セルリスト（セル幅は近傍リストのカットオフに合わせる）
+    nl::NL      # 近傍リスト
 end
 
-function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T}) where {T}
+"""
+    State(backend, X0, V0, p; skin = 0.2, interval = 4, maxnb = 64)
+
+キーワード引数は近傍リストの設定（[`NeighborList`](@ref) を参照）。
+セルリストのセル幅は近傍リストのカットオフ `2h(1+skin)` に合わせて作る
+（3×3 走査が成立するにはセル幅がカットオフ以上である必要がある）。
+"""
+function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T};
+               skin = 0.2, interval = 4, maxnb = 64) where {T}
     N = size(X0, 2)
     X = KernelAbstractions.allocate(backend, T, 2, N)
     V = KernelAbstractions.allocate(backend, T, 2, N)
@@ -20,7 +29,9 @@ function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T})
     z1() = KernelAbstractions.zeros(backend, T, N)
     copyto!(X, T.(X0))
     copyto!(V, T.(V0))
-    return State(X, V, a, z1(), z1(), z1(), CellList(backend, N, p))
+    nl = NeighborList(backend, N, p; skin, interval, maxnb)
+    cl = CellList(backend, N, p; cs = nl.rc)
+    return State(X, V, a, z1(), z1(), z1(), cl, nl)
 end
 
 # --- テープ ---------------------------------------------------------------
@@ -96,6 +107,9 @@ function simulate!(st::State, theta, p::SPHParams, backend, nsteps::Integer; tap
     # 内側のループは一切同期しない（`step!` の docstring 参照）。公開 API の
     # 境界としてここで 1 回だけ待ち、戻った時点で状態が確定しているようにする。
     KernelAbstractions.synchronize(backend)
+    # 近傍リストの異常（行溢れ・変位超過）はここでまとめて報告する。
+    # 毎ステップ見ると同期が入ってしまうので、境界での事後検出にしている。
+    check_neighbor_flags(st.nl)
     return st
 end
 
@@ -124,13 +138,20 @@ end
 `ws.gX`（=∂J/∂X_0）、`ws.gV`（=∂J/∂V_0）、`ws.gtheta`（=∂J/∂θ）を埋める。
 """
 function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, backend;
-                   seedX, seedV) where {T}
+                   seedX, seedV, scratch = nothing,
+                   skin = 0.2, interval = 4, maxnb = 64) where {T}
     N = size(ws.gX, 2)
     copyto!(ws.gX, seedX)
     copyto!(ws.gV, seedV)
     fill!(ws.gtheta, zero(T))
 
-    scratch = State(backend, zeros(T, 2, N), zeros(T, 2, N), p)
+    # 近傍リストの設定は前進と揃えること。相互作用集合が同一であれば離散随伴は
+    # 厳密なままだが、変位の上限を破っている設定では前進と逆行で欠落する近傍が
+    # 食い違い、勾配がずれる。
+    # `scratch` を渡せば毎回の確保を避けられる（最適化ループでは効く）。
+    if scratch === nothing
+        scratch = State(backend, zeros(T, 2, N), zeros(T, 2, N), p; skin, interval, maxnb)
+    end
 
     for n in length(tape):-1:1
         _tape_load!(backend)(scratch.X, tape.X, n; ndrange = N)
@@ -138,11 +159,13 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
 
         # 前進で使った近傍リストと密度・EOS 前計算を再構成
         # （テープには X, V しか積まない）
-        build!(scratch.cl, scratch.X, p, backend)
-        cs = T(scratch.cl.cs)
-        density_kernel!(backend)(scratch.rho, scratch.X, scratch.cl.starts,
-                                 scratch.cl.counts, scratch.cl.order,
-                                 p.h, p.m, cs, scratch.cl.nx, scratch.cl.ny; ndrange = N)
+        #
+        # 再構築のタイミングは前進と揃っていなくてよい。物理カーネルが
+        # r² < (2h)² で絞るので、リストが上位集合であれば相互作用集合は同一に
+        # なり、離散随伴は厳密なまま（詳細は src/neighbors.jl 冒頭のコメント）。
+        maybe_rebuild!(scratch.nl, scratch.cl, scratch.X, p, backend)
+        density_kernel!(backend)(scratch.rho, scratch.X, scratch.nl.counts,
+                                 scratch.nl.indices, p.h, p.m, N; ndrange = N)
         eos_kernel!(backend)(scratch.pterm, scratch.invrho, scratch.rho,
                              p.c^2, p.rho0; ndrange = N)
 
@@ -154,21 +177,21 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
         adj_pass1_kernel!(backend)(ws.gXs, ws.gVs, ws.grho, ws.galpha,
                                    ws.abar, scratch.X, scratch.V,
                                    scratch.pterm, scratch.invrho, theta,
-                                   scratch.cl.starts, scratch.cl.counts, scratch.cl.order,
-                                   p, cs, scratch.cl.nx, scratch.cl.ny; ndrange = N)
+                                   scratch.nl.counts, scratch.nl.indices,
+                                   p, N; ndrange = N)
 
         adj_design_kernel!(backend)(ws.gtheta, ws.gXs, ws.galpha, scratch.X, theta, p;
                                     ndrange = N)
 
-        adj_pass2_kernel!(backend)(ws.gXs, ws.grho, scratch.X, scratch.cl.starts,
-                                   scratch.cl.counts, scratch.cl.order,
-                                   p.h, p.m, cs, scratch.cl.nx, scratch.cl.ny; ndrange = N)
+        adj_pass2_kernel!(backend)(ws.gXs, ws.grho, scratch.X, scratch.nl.counts,
+                                   scratch.nl.indices, p.h, p.m, N; ndrange = N)
 
         _axpy2!(backend)(ws.gX, ws.gXs; ndrange = N)
         _axpy2!(backend)(ws.gV, ws.gVs; ndrange = N)
     end
     # 逆行ループも同期しない（1 ステップに 7 回入っていた）。戻る直前に 1 回だけ。
     KernelAbstractions.synchronize(backend)
+    check_neighbor_flags(scratch.nl)
     return ws
 end
 

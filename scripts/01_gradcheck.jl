@@ -56,8 +56,15 @@ nsteps = 25
 cX = randn(rng, T, 2, N)
 cV = randn(rng, T, 2, N)
 
+# 勾配検証は近傍リストの再利用を使わない（`interval = 1` = 毎ステップ組み直し）。
+# 再利用が結果を変えないことは test/runtests.jl の専用 testset で検証しており、
+# ここで見たいのは随伴そのものの正しさだから。
+#
+# なおこの設定は壁ペナルティが強く 1 ステップの変位が大きいため、既定の
+# `interval = 8` では変位の上限（skin·h）を破る。破ると前進と逆行で欠落する
+# 近傍が食い違い、勾配が 1e-2 程度ずれる（そのときは警告が出る）。
 function run_forward(X0, V0, theta; want_tape = false)
-    st = State(backend, X0, V0, p)
+    st = State(backend, X0, V0, p; interval = 1)
     th = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
     copyto!(th, theta)
     tape = want_tape ? Tape(backend, N, nsteps, p) : nothing
@@ -72,7 +79,7 @@ end
 
 J, st, th, tape = run_forward(X0, V0, theta0; want_tape = true)
 ws = AdjointWorkspace(backend, N, p)
-backward!(ws, tape, th, p, backend; seedX = cX, seedV = cV)
+backward!(ws, tape, th, p, backend; seedX = cX, seedV = cV, interval = 1)
 
 gth = Array(ws.gtheta)
 gX = Array(ws.gX)

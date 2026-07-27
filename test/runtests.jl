@@ -41,7 +41,7 @@ end
 #    突き合わせて確認する。README に挙げた「引っかかりそうな箇所」1〜3 は
 #    ここが落ちれば一発で分かる。
 # ---------------------------------------------------------------------------
-@testset "セルリスト vs 総当たり密度" begin
+@testset "セルリスト・近傍リスト vs 総当たり" begin
     rng = MersenneTwister(42)
     p = SPHParams{T}(h = 0.06, m = 0.004, rho0 = 1.0, c = 10.0, mu = 0.02,
                      dt = 1e-4, Lx = 1.0, Ly = 0.6, kw = 1e4, ngx = 9, ngy = 7)
@@ -56,14 +56,34 @@ end
     @test ord == collect(Int32(1):Int32(N))
     @test sum(Array(st.cl.counts)) == N
 
+    # 近傍リストが「カットオフ内の粒子を過不足なく含む」こと（総当たりと比較）
+    build_neighbors!(st.nl, st.cl, st.X, p, backend)
+    KernelAbstractions.synchronize(backend)
+    Xh = Array(st.X)
+    nbc = Array(st.nl.counts)
+    idx = Array(st.nl.indices)
+    rc2 = T(st.nl.rc^2)
+    r2min = eps(T) * p.h * p.h
+    ok = true
+    for i in 1:N
+        got = sort([idx[(m-1)*N+i] for m in 1:nbc[i]])
+        want = Int32[]
+        for j in 1:N
+            r2 = (Xh[1, i] - Xh[1, j])^2 + (Xh[2, i] - Xh[2, j])^2
+            (r2min < r2 < rc2) && push!(want, Int32(j))
+        end
+        got == sort(want) || (ok = false; break)
+    end
+    @test ok
+    @test all(nbc .<= st.nl.maxnb)
+    @test Array(st.nl.flags) == Int32[0, 0]      # 溢れも変位超過も無い
+
+    # 密度が総当たりと一致すること（自己項を含む）
     SPHAdjoint.density_kernel!(backend)(
-        st.rho, st.X, st.cl.starts, st.cl.counts, st.cl.order,
-        p.h, p.m, T(st.cl.cs), st.cl.nx, st.cl.ny; ndrange = N)
+        st.rho, st.X, st.nl.counts, st.nl.indices, p.h, p.m, N; ndrange = N)
     KernelAbstractions.synchronize(backend)
 
-    # 総当たり
     A = SPHAdjoint.wnorm(p.h)
-    Xh = Array(st.X)
     rho_ref = zeros(T, N)
     for i in 1:N, j in 1:N
         r = hypot(Xh[1, i] - Xh[1, j], Xh[2, i] - Xh[2, j])
@@ -71,6 +91,58 @@ end
     end
 
     @test Array(st.rho) ≈ rho_ref rtol = 1e-12
+end
+
+# ---------------------------------------------------------------------------
+# 近傍リストの再利用が結果を変えないこと
+#   物理カーネルが r² < (2h)² で絞るので、リストが上位集合であれば
+#   毎ステップ構築した場合と厳密に同じ相互作用集合になる（= ビット一致）。
+# ---------------------------------------------------------------------------
+@testset "近傍リストの再利用が結果を変えない" begin
+    rng = MersenneTwister(7)
+    # 実際の設定と同じ密度にすること（格子間隔 dp、h = 1.3 dp）。
+    # これより密にすると 1 粒子あたりの近傍数が maxnb を超えて溢れる
+    # （そのときは flags[1] が立って警告が出る）。
+    dp = 0.02
+    p = SPHParams{T}(h = 1.3 * dp, m = dp^2, rho0 = 1.0, c = 10.0, mu = 0.02,
+                     dt = 1e-4, Lx = 1.0, Ly = 0.6, kw = 1e4, ngx = 9, ngy = 7)
+    xs = dp:dp:0.24
+    ys = dp:dp:0.20
+    N = length(xs) * length(ys)
+    X0 = zeros(T, 2, N)
+    k = 0
+    for y in ys, x in xs
+        k += 1
+        X0[1, k] = x + 0.1 * dp * randn(rng)
+        X0[2, k] = y + 0.1 * dp * randn(rng)
+    end
+    V0 = 0.05 .* randn(rng, T, 2, N)
+    th = KernelAbstractions.zeros(backend, T, p.ngy, p.ngx)
+
+    # interval=1（毎ステップ構築）と interval=8（既定）で 40 ステップ回す
+    a = State(backend, X0, V0, p; interval = 1)
+    b = State(backend, X0, V0, p; interval = 8)
+    simulate!(a, th, p, backend, 40)
+    simulate!(b, th, p, backend, 40)
+
+    # 本質的な不変量: 実効的な相互作用集合（r < 2h）が完全に一致すること。
+    # リストが真の近傍の上位集合であれば、物理カーネルの r² 判定で同じ集合に
+    # 絞られる。これが成り立つ限り離散随伴も厳密なまま。
+    r2max = (2 * p.h)^2
+    effective(st) = begin
+        nbc = Array(st.nl.counts)
+        idx = Array(st.nl.indices)
+        Xs = Array(st.X)
+        [Set(j for m in 1:nbc[i] for j in (idx[(m-1)*N+i],)
+             if (Xs[1, i] - Xs[1, j])^2 + (Xs[2, i] - Xs[2, j])^2 < r2max) for i in 1:N]
+    end
+    @test effective(a) == effective(b)
+
+    # 数値としては行内の並び順が違うぶん総和順序が変わるので、ビット一致では
+    # なく ulp レベルで一致する（実測: X はビット一致、V の差は 1 ulp）。
+    @test Array(a.X) ≈ Array(b.X) rtol = 1e-14
+    @test Array(a.V) ≈ Array(b.V) rtol = 1e-14
+    @test Array(b.nl.flags) == Int32[0, 0]
 end
 
 # ---------------------------------------------------------------------------
@@ -96,8 +168,13 @@ end
     cX = randn(rng, T, 2, N)
     cV = randn(rng, T, 2, N)
 
+    # 近傍リストの再利用は別の testset で検証しているので、ここでは interval=1
+    # （毎ステップ組み直し）に固定して随伴そのものだけを見る。
+    # なおこの設定は壁ペナルティが強く 1 ステップの変位が大きいため、既定の
+    # interval=8 だと変位の上限を破って警告が出る（勾配自体は保たれるが、
+    # 保証が効かない領域に入る）。
     function run_forward(X0, V0, theta; want_tape = false)
-        st = State(backend, X0, V0, p)
+        st = State(backend, X0, V0, p; interval = 1)
         th = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
         copyto!(th, theta)
         tape = want_tape ? Tape(backend, N, nsteps, p) : nothing
@@ -111,7 +188,7 @@ end
     @test all(isfinite, Array(st.X))
 
     ws = AdjointWorkspace(backend, N, p)
-    backward!(ws, tape, th, p, backend; seedX = cX, seedV = cV)
+    backward!(ws, tape, th, p, backend; seedX = cX, seedV = cV, interval = 1)
     gth = Array(ws.gtheta)
     gX = Array(ws.gX)
     gV = Array(ws.gV)
@@ -153,8 +230,10 @@ end
     end
     V0 = fill(T(1.0), 2, N)
 
+    # |v| が音速を超えるほど激しい設定なので、近傍リストの再利用は使わない
+    # （変位が上限を破って警告が出る。ここで見たいのは抗力の効果だけ）
     ke(th) = begin
-        st = State(backend, X0, V0, p)
+        st = State(backend, X0, V0, p; interval = 1)
         thd = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
         copyto!(thd, fill(T(th), p.ngy, p.ngx))
         simulate!(st, thd, p, backend, 200)
