@@ -1,5 +1,32 @@
 # # カーネル変種の実験：Metal はどこまで速くなるか
 #
+# > **【履歴】このスクリプトは旧 API 前提で、現在の `src/` では走らない（#17）。**
+# >
+# > 本番カーネルがセル走査から近傍リスト走査に変わった（#1 / PR #14）ため、
+# > ここでベースラインとして呼んでいる
+# > `density_kernel!(…, cl.starts, cl.counts, cl.order, …)` が現在の
+# > シグネチャと合わない。`accel_kernel!` はさらに古く、`pterm` / `invrho` を
+# > 前計算する前の形（このスクリプトがその前計算を提案した側なので当然）。
+# >
+# > **呼び出しだけ直すのは意味がない。** 比較対象の変種カーネルは意図的に
+# > 旧形式（`starts, counts, order`）で定義してあり、本番だけ差し替えると
+# > 「セル走査の変種 vs リスト方式の本番」という土俵の違う比較になる。
+# >
+# > 結論（inbounds / r² 早期棄却 / 除算の前計算 / Int32 セル添字）は
+# > `src/forward.jl` 冒頭のコメントに取り込み済み。当時の測定を再現したいときは、
+# > **そのときのコードごと**取り出すこと：
+# >
+# > ```console
+# > git worktree add /tmp/sph-3bed1cb 3bed1cb
+# > cp Manifest.toml /tmp/sph-3bed1cb/      # Manifest は gitignore なので要コピー
+# > JULIA_PKG_PRECOMPILE_AUTO=0 \
+# >   julia --project=/tmp/sph-3bed1cb /tmp/sph-3bed1cb/scripts/07_kernel_tuning.jl
+# > ```
+# >
+# > 手順は実際に通して確認済み（2026-07-29）。`JULIA_PKG_PRECOMPILE_AUTO=0` が
+# > 要るのは、`GLMakie` が `[deps]` にあるせいでヘッドレスの precompile が
+# > segfault するから（#13）。SPHAdjoint 自体は問題なく読める。
+#
 # `06_metal_profile.jl` の結論は「物理カーネル 2 本で 90%、実効帯域はピークの
 # 33%」だった。33% で止まっているということは、帯域律速と断定できない。
 # 現行カーネルには演算側の無駄が 3 つある：
