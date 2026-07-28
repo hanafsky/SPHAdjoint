@@ -74,7 +74,7 @@ end
     pterm[i] = T(c2) * (ri - T(rho0)) * inv * inv
 end
 
-@kernel inbounds = true function accel_kernel!(a, @Const(X), @Const(V), @Const(pterm),
+@kernel inbounds = true function accel_kernel!(a, alpha, @Const(X), @Const(V), @Const(pterm),
                                                @Const(invrho), @Const(theta),
                                                @Const(nbcount), @Const(indices), p, sm, si)
     i = @index(Global)
@@ -118,18 +118,28 @@ end
         end
     end
 
-    alpha, _, _ = interp_alpha(theta, xi, yi, p)
-    ax += p.gx - alpha * vxi + wall_accel(xi, p.Lx, p.kw)
-    ay += p.gy - alpha * vyi + wall_accel(yi, p.Ly, p.kw)
+    # Brinkman 抗力はここに入れない。速度更新を陰的にするため、係数だけ返して
+    # integrate_kernel! で `v' = (v + dt a) / (1 + dt α)` として解く。
+    # 陽解法だと dt < 2/α_max の制限があり、固体を硬くしたくて α_max を上げると
+    # すぐ発散していた。陰的にすれば無条件安定。
+    al, _, _ = interp_alpha(theta, xi, yi, p)
+    alpha[i] = al
+    ax += p.gx + wall_accel(xi, p.Lx, p.kw)
+    ay += p.gy + wall_accel(yi, p.Ly, p.kw)
 
     a[1, i] = ax
     a[2, i] = ay
 end
 
-@kernel inbounds = true function integrate_kernel!(X, V, @Const(a), dt)
+# semi-implicit Euler。Brinkman 抗力だけ陰的に解く:
+#   v' = (v + dt a_rest) / (1 + dt α)
+# 陽解法（v' = v + dt(a_rest - α v)）は dt < 2/α_max の制限があるが、これは無条件安定。
+@kernel inbounds = true function integrate_kernel!(X, V, @Const(a), @Const(alpha), dt)
     i = @index(Global)
-    v1 = V[1, i] + dt * a[1, i]
-    v2 = V[2, i] + dt * a[2, i]
+    T = eltype(X)
+    D = one(T) / (one(T) + dt * alpha[i])
+    v1 = (V[1, i] + dt * a[1, i]) * D
+    v2 = (V[2, i] + dt * a[2, i]) * D
     V[1, i] = v1
     V[2, i] = v2
     X[1, i] += dt * v1
@@ -156,8 +166,8 @@ function step!(st, theta, p::SPHParams{T}, backend) where {T}
     density_kernel!(backend)(st.rho, st.X, st.nl.counts, st.nl.indices,
                              p.h, p.m, st.nl.sm, st.nl.si; ndrange = N)
     eos_kernel!(backend)(st.pterm, st.invrho, st.rho, p.c^2, p.rho0; ndrange = N)
-    accel_kernel!(backend)(st.a, st.X, st.V, st.pterm, st.invrho, theta,
+    accel_kernel!(backend)(st.a, st.alpha, st.X, st.V, st.pterm, st.invrho, theta,
                            st.nl.counts, st.nl.indices, p, st.nl.sm, st.nl.si; ndrange = N)
-    integrate_kernel!(backend)(st.X, st.V, st.a, p.dt; ndrange = N)
+    integrate_kernel!(backend)(st.X, st.V, st.a, st.alpha, p.dt; ndrange = N)
     return st
 end

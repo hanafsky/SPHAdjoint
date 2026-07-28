@@ -9,6 +9,7 @@ mutable struct State{AT,VT,CL,NL}
     rho::VT     # (N,)
     pterm::VT   # (N,)  p/ρ²（eos_kernel! の前計算。ペアループから除算を消す）
     invrho::VT  # (N,)  1/ρ
+    alpha::VT   # (N,)  Brinkman 抗力係数（陰的な速度更新で使う）
     cl::CL      # セルリスト（セル幅は近傍リストのカットオフに合わせる）
     nl::NL      # 近傍リスト
 end
@@ -31,7 +32,7 @@ function State(backend, X0::AbstractMatrix, V0::AbstractMatrix, p::SPHParams{T};
     copyto!(V, T.(V0))
     nl = NeighborList(backend, N, p; skin, interval, maxnb, layout)
     cl = CellList(backend, N, p; cs = nl.rc)
-    return State(X, V, a, z1(), z1(), z1(), cl, nl)
+    return State(X, V, a, z1(), z1(), z1(), z1(), cl, nl)
 end
 
 # --- テープ ---------------------------------------------------------------
@@ -171,12 +172,19 @@ function backward!(ws::AdjointWorkspace, tape::Tape, theta, p::SPHParams{T}, bac
         eos_kernel!(backend)(scratch.pterm, scratch.invrho, scratch.rho,
                              p.c^2, p.rho0; ndrange = N)
 
+        # 前進で使った a_rest と α を再現する（テープには X, V しか積まない）
+        accel_kernel!(backend)(scratch.a, scratch.alpha, scratch.X, scratch.V,
+                               scratch.pterm, scratch.invrho, theta,
+                               scratch.nl.counts, scratch.nl.indices, p,
+                               scratch.nl.sm, scratch.nl.si; ndrange = N)
+
         # X' = X + dt V'   →  ḡV' = ḡV + dt ḡX
         _adj_integrate!(backend)(ws.gV, ws.gX, p.dt; ndrange = N)
-        # V' = V + dt a    →  ā = dt ḡV'
-        _scale2!(backend)(ws.abar, ws.gV, p.dt; ndrange = N)
+        # 陰的な抗力の随伴。ā, ᾱ を作り、ḡV を D 倍する（詳細は _adj_drag!）
+        _adj_drag!(backend)(ws.abar, ws.gV, ws.galpha, scratch.V, scratch.a,
+                            scratch.alpha, p.dt; ndrange = N)
 
-        adj_pass1_kernel!(backend)(ws.gXs, ws.gVs, ws.grho, ws.galpha,
+        adj_pass1_kernel!(backend)(ws.gXs, ws.gVs, ws.grho,
                                    ws.abar, scratch.X, scratch.V,
                                    scratch.pterm, scratch.invrho, theta,
                                    scratch.nl.counts, scratch.nl.indices,
