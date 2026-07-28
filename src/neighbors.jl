@@ -57,10 +57,33 @@ end
     order[pos] = Int32(i)
 end
 
+@kernel inbounds = true function _cl_sort_cells!(order, @Const(starts), @Const(counts))
+    c = @index(Global)
+    # セル内を粒子 id の昇順に並べ替える。`_cl_fill!` のアトミック cursor は
+    # 格納順が実行ごとに変わるため、これをしないと総和順序が非決定的になり、
+    # GPU では同一入力でも 1 ステップあたり ~1e-7 揺らぐ。長時間積分では
+    # カオス的に増幅し、N=1500 を 5333 ステップ回すと目的関数が 0.29% ばらつく。
+    #
+    # 1 セルあたりの粒子数は 2h(1+skin) のセル幅で 10 個程度なので挿入ソートで足りる。
+    # しかも近傍リストの再構築間隔（既定 4 ステップ）ごとにしか走らない。
+    s = starts[c]
+    n = counts[c]
+    for k in Int32(2):n
+        v = order[s+k]
+        j = k - Int32(1)
+        while j >= Int32(1) && order[s+j] > v
+            order[s+j+Int32(1)] = order[s+j]
+            j -= Int32(1)
+        end
+        order[s+j+Int32(1)] = v
+    end
+end
+
 """
     build!(cl, X, p, backend)
 
-セルリストを組み直す。
+セルリストを組み直す。セル内は粒子 id の昇順に整列されるので、
+総和順序が実行ごとに変わらない（GPU の非決定性の根治）。
 
 !!! note "同期しない"
     ここでは `synchronize` を呼ばない。同一 backend のカーネルと配列演算は
@@ -83,6 +106,10 @@ function build!(cl::CellList, X, p::SPHParams{T}, backend) where {T}
     cl.cursor .= cl.starts
 
     _cl_fill!(backend)(cl.order, cl.cursor, cl.cellof; ndrange = N)
+
+    # セル内を粒子 id 順に整列させて総和順序を決定的にする（詳細は
+    # `_cl_sort_cells!` のコメント）。ncell スレッド、1 セルあたり十数要素。
+    _cl_sort_cells!(backend)(cl.order, cl.starts, cl.counts; ndrange = length(cl.counts))
     return cl
 end
 
