@@ -44,8 +44,24 @@ end
 V0 .= 0.05 .* randn(rng, T, size(V0))
 N = size(X0, 2)
 
-theta0 = 3 .* rand(rng, T, p.ngy, p.ngx)
+# θ のスケールは外から `THETA_SCALE` で差し替えられる。
+#
+# 既定の 3 は `dt·α ≈ 3e-3`、つまり陰解法の減衰因子 `D = 1/(1+dt·α)` が
+# ほぼ 1 のままで、**抗力を陰的にした部分がほとんど効いていない領域**しか
+# 検証していないことになる（陽解法版と数値的に区別がつかない）。
+# 大きい `α_max` を使うなら、`D` が 1 から大きく外れる領域でも
+# 随伴が合うことを確認しておくこと（`scripts/03_optimize.jl` の設計場は
+# `α_max` をこの何桁も上に取る）。
+if !@isdefined(THETA_SCALE)
+    THETA_SCALE = 3.0
+end
+theta0 = T(THETA_SCALE) .* rand(rng, T, p.ngy, p.ngx)
 nsteps = 25
+
+@printf("θ ∈ [%.3g, %.3g],  dt·α ∈ [%.3g, %.3g],  D = 1/(1+dt·α) ∈ [%.4g, %.4g]\n",
+        minimum(theta0), maximum(theta0),
+        p.dt * minimum(theta0), p.dt * maximum(theta0),
+        1 / (1 + p.dt * maximum(theta0)), 1 / (1 + p.dt * minimum(theta0)))
 
 # ## 目的関数
 #
@@ -96,9 +112,13 @@ end
 
 hfd = 1e-6
 
+# θ 側だけ相対ステップにする。`THETA_SCALE` を上げたときに絶対 1e-6 のままだと
+# 摂動が θ の丸め（3e4 に対して相対 3e-11）に埋もれ、差分側が壊れる。
+hfd_theta = hfd * max(1.0, THETA_SCALE)
+
 println("dJ/dtheta  (中心差分と比較)")
 for idx in [CartesianIndex(1, 1), CartesianIndex(4, 5), CartesianIndex(6, 3)]
-    g = fd(t -> run_forward(X0, V0, t)[1], theta0, idx, hfd)
+    g = fd(t -> run_forward(X0, V0, t)[1], theta0, idx, hfd_theta)
     rel = abs(gth[idx] - g) / max(abs(g), 1e-30)
     @printf("  theta[%d,%d]: 随伴 % .9e   FD % .9e   rel %.2e\n",
             idx[1], idx[2], gth[idx], g, rel)
@@ -124,6 +144,22 @@ end
 #
 # 相対誤差は `1e-6` 台まで落ちるはず（中心差分側の打ち切り・丸めが支配する）。
 # `1e-2` を超えるようなら随伴か移植のどこかが壊れている。
+#
+# ### `THETA_SCALE` を上げたときの `dJ/dV0`
+#
+# 抗力が強いと初期速度の影響が終端までにほとんど減衰するので、`dJ/dV0` の
+# **絶対値そのものが小さくなる**（`THETA_SCALE = 3e4` で 1e-5 台）。
+# すると差分商 `(J⁺-J⁻)/2h` の丸め（`ε·|J|/2h ≈ 5e-10`）が相対誤差として
+# 効いてきて、`hfd = 1e-6` のままだと 1e-6 台に見える。随伴の誤りではなく
+# **差分側の限界**で、実測は次のとおり（`THETA_SCALE = 3e4`）：
+#
+# | `hfd` | 1e-6 | 1e-5 | 1e-4 | 1e-3 |
+# |---|---:|---:|---:|---:|
+# | `V0[1,5]` | 2.65e-06 | 5.69e-07 | 5.52e-08 | 3.14e-09 |
+# | `V0[2,30]` | 1.08e-06 | 1.08e-06 | 1.23e-07 | 2.13e-08 |
+#
+# 疑わしいときは `hfd` を振ってみること。**単調に下がるなら差分側の丸め、
+# 下げ止まるなら随伴を疑う。**
 #
 # 参考として、同じ定式化を NumPy に書いて PyTorch の自動微分と比較した結果は
 # `dJ/dX0` 2.6e-15, `dJ/dV0` 1.4e-15, `dJ/dθ` 1.0e-15
