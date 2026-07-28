@@ -254,3 +254,41 @@ end
     @test ke(500.0) < ke(0.0)      # 抗力ありのほうが運動エネルギーが小さい
 end
 
+# ---------------------------------------------------------------------------
+# 5. 抗力が陰的なので α_max を上げても発散しないこと
+#    陽解法版は dt < 2/α_max の制限があり、α_max を上げるとすぐ発散した。
+#    通常の SPH 設定（h = 1.3 dp）で見る。testset 4 は h = 3 dp の過剰平滑化な
+#    設定で近傍数が maxnb 近くまで来るため、安定性の検証には向かない。
+# ---------------------------------------------------------------------------
+@testset "抗力の陰解法で α_max を上げても発散しない" begin
+    dp = 0.02
+    p = SPHParams{T}(h = 1.3 * dp, m = dp^2, rho0 = 1.0, c = 15.0, mu = 0.05,
+                     dt = 2.0e-4, Lx = 1.0, Ly = 0.5, kw = 5.0e4, ngx = 33, ngy = 17)
+    xs = dp:dp:0.24
+    ys = dp:dp:0.20
+    N = length(xs) * length(ys)
+    X0 = zeros(T, 2, N)
+    k = 0
+    for y in ys, x in xs
+        k += 1
+        X0[1, k] = x
+        X0[2, k] = y
+    end
+    @test count(j -> X0[1, j] == 0 && X0[2, j] == 0, 1:N) == 0   # 配置が壊れていない
+
+    explicit_limit = 2 / p.dt          # 陽解法ならここで発散していた（= 1e4）
+    function run_alpha(alpha_max)
+        st = State(backend, X0, zeros(T, 2, N), p; interval = 2)
+        th = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
+        copyto!(th, fill(T(alpha_max), p.ngy, p.ngx))
+        simulate!(st, th, p, backend, 300)
+        return maximum(abs, Array(st.V)), all(isfinite, Array(st.X))
+    end
+
+    v_soft, ok_soft = run_alpha(explicit_limit / 10)   # 陽解法でも通る領域
+    v_hard, ok_hard = run_alpha(explicit_limit * 10)   # 陽解法なら発散する領域
+    @test ok_soft
+    @test ok_hard
+    @test v_hard < v_soft                              # 硬いほど止まる
+end
+
