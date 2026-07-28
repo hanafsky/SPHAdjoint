@@ -1,5 +1,33 @@
 # # CSR 近傍リストのプロトタイプ（issue #1）
 #
+# > **【履歴】このスクリプトは旧 API 前提で、現在の `src/` では走らない（#17）。**
+# >
+# > ここで比較していた「転置・行長固定」のレイアウトが **#1 で本番になった**
+# > （`src/neighbors.jl` の `NeighborList`）。つまりこのファイルは
+# > **プロトタイプが本番に昇格する前の姿**で、ベースラインとして呼んでいる
+# > `density_kernel!(…, cl.starts, cl.counts, cl.order, …)` は今の
+# > シグネチャと合わない。レイアウト比較そのものは #16 で `layout` キーワード
+# > （`:slot` / `:particle`）として本番に入り、CPU / GPU で切り替わる。
+# >
+# > 結論（素直な CSR は構築がセルリストの 10 倍で割に合わない、転置なら構築
+# > 422 μs で density 1.86x / accel 1.87x、損益分岐となる再構築間隔）は
+# > `src/neighbors.jl` 冒頭のコメントに取り込み済み。当時の測定を再現したい
+# > ときは、そのときのコードごと取り出すこと：
+# >
+# > ```console
+# > git worktree add /tmp/sph-42b40c8 42b40c8
+# > cp Manifest.toml /tmp/sph-42b40c8/      # Manifest は gitignore なので要コピー
+# > JULIA_PKG_PRECOMPILE_AUTO=0 \
+# >   julia --project=/tmp/sph-42b40c8 /tmp/sph-42b40c8/scripts/09_neighbor_list.jl
+# > ```
+# >
+# > 手順は実際に通して確認済み（2026-07-29）。`JULIA_PKG_PRECOMPILE_AUTO=0` が
+# > 要るのは、`GLMakie` が `[deps]` にあるせいでヘッドレスの precompile が
+# > segfault するから（#13）。
+# >
+# > **今の実装の内訳を見たいなら `06_metal_profile.jl`**（新パイプラインに
+# > 追従済み）を使うこと。
+#
 # ## なぜやるか
 #
 # N=60000 の 1 ステップ 687 μs のうち accel が約 410 μs（60%）。

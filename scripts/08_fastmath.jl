@@ -1,5 +1,27 @@
 # # @fastmath は効くか
 #
+# > **【履歴】このスクリプトは旧 API 前提で、現在の `src/` では走らない（#17）。**
+# >
+# > 本番カーネルがセル走査から近傍リスト走査に変わった（#1 / PR #14）ため、
+# > ベースラインの `density_kernel!(…, cl.starts, cl.counts, cl.order, …)` /
+# > `accel_kernel!(…)` が現在のシグネチャと合わない。比較対象の変種は
+# > 意図的に旧形式で定義してあるので、呼び出しだけ直しても土俵が揃わない。
+# >
+# > 結論（**sqrt だけ fastmath で +14%、ただし density のみ。accel は
+# > gather 律速で効かない**）は `src/forward.jl` の `density_kernel!` に
+# > 取り込み済み。当時の測定を再現したいときは、そのときのコードごと取り出すこと：
+# >
+# > ```console
+# > git worktree add /tmp/sph-3bed1cb 3bed1cb
+# > cp Manifest.toml /tmp/sph-3bed1cb/      # Manifest は gitignore なので要コピー
+# > JULIA_PKG_PRECOMPILE_AUTO=0 \
+# >   julia --project=/tmp/sph-3bed1cb /tmp/sph-3bed1cb/scripts/08_fastmath.jl
+# > ```
+# >
+# > 手順は実際に通して確認済み（2026-07-29）。`JULIA_PKG_PRECOMPILE_AUTO=0` が
+# > 要るのは、`GLMakie` が `[deps]` にあるせいでヘッドレスの precompile が
+# > segfault するから（#13）。
+#
 # 文献調査で「期待値 1 割前後・条件付き」とされた fast math の実測。
 #
 # 予想としては効果は小さいはず：07 の改修でペアループから除算を消し、
