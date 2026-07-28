@@ -27,7 +27,7 @@
 # 前進側と同じチューニングを適用してある（inbounds / r² 早期棄却 / 除算の前計算 /
 # Int32 セル走査。詳細は src/forward.jl 冒頭のコメントと scripts/07_kernel_tuning.jl）。
 # pterm = p/ρ², invrho = 1/ρ は前進と同じ eos_kernel! で作る。
-@kernel inbounds = true function adj_pass1_kernel!(gX, gV, grho, galpha,
+@kernel inbounds = true function adj_pass1_kernel!(gX, gV, grho,
                                    @Const(abar), @Const(X), @Const(V),
                                    @Const(pterm), @Const(invrho),
                                    @Const(theta), @Const(nbcount), @Const(indices),
@@ -107,11 +107,8 @@
     grh += (-2 * mass * pti * iri) * sumS
     grh += c2 * mass * iri * iri * sumS
 
-    # Brinkman 抗力
-    alpha, _, _ = interp_alpha(theta, xi, yi, p)
-    gvx -= alpha * abx
-    gvy -= alpha * aby
-    galpha[i] = -(abx * vxi + aby * vyi)
+    # Brinkman 抗力はここでは扱わない（陰的な速度更新の随伴として
+    # `_adj_drag!` が ᾱ と v̄ のスケールを担当する）。
 
     # 壁
     gx += abx * wall_daccel(xi, p.Lx, p.kw)
@@ -203,4 +200,29 @@ end
     i = @index(Global)
     dst[1, i] = s * src[1, i]
     dst[2, i] = s * src[2, i]
+end
+
+# 陰的な抗力 `v' = (v + dt a) / (1 + dt α)` の随伴。D = 1/(1+dt α) として
+#
+#   ∂v'/∂v = D        →  v̄  = D v̄'
+#   ∂v'/∂a = dt D     →  ā  = dt D v̄'
+#   ∂v'/∂α = -v' dt D →  ᾱ  = -dt D (v' · v̄')
+#
+# 陽解法版は ā = dt v̄'、ᾱ = -dt (v̄' · v) だったので、どちらも D と
+# 「新しい速度 v'」に変わる点が違う。v' はテープに積んでいないので
+# a と V から再計算する。
+@kernel inbounds = true function _adj_drag!(abar, gV, galpha, @Const(V), @Const(a),
+                                            @Const(alpha), dt)
+    i = @index(Global)
+    T = eltype(gV)
+    D = one(T) / (one(T) + dt * alpha[i])
+    vx = (V[1, i] + dt * a[1, i]) * D        # v'（更新後の速度）を再計算
+    vy = (V[2, i] + dt * a[2, i]) * D
+    gx = gV[1, i]                            # v̄'
+    gy = gV[2, i]
+    abar[1, i] = dt * D * gx
+    abar[2, i] = dt * D * gy
+    galpha[i] = -dt * D * (vx * gx + vy * gy)
+    gV[1, i] = D * gx
+    gV[2, i] = D * gy
 end
