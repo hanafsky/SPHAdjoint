@@ -81,25 +81,37 @@ target = (0.85, 0.10)          # 目標領域の中心
 sigma = 0.10
 
 # ---- 設計変数 -------------------------------------------------------------
+#
+# **設計変数まわりは粒子側の精度（Metal では Float32）と切り離して常に Float64
+# で持つ。** 設計変数は 561 個で CPU 上の処理なのでコストは無視できる一方、
+# `α(ρ)` は `α_max` を掛けるので ρ の 1e-7 の丸めが `α_max·1e-7` に化ける。
+# `α_max = 2e5` では全部流体（`rd ≡ 1`）ですら `α` が負に振れ、
+# 速度を増幅する「負の抗力」になっていた（`apply_filter` のコメント参照）。
+const TW = Float64
+#
 # rd ∈ [0,1]:  rd=1 → 流体（α=0）、rd=0 → 固体（α=α_max）
 # Borrvall–Petersson の凸補間:
 #   α(ρ) = α_max · qp (1-ρ) / (qp + ρ)
-alpha_max = T(2000.0)
-qp = T(0.1)
-volfrac = T(0.75)              # 流体として残す体積割合の下限
+alpha_max = TW(2000.0)
+qp = TW(0.1)
+volfrac = TW(0.75)             # 流体として残す体積割合の下限
 filt_r = 2                     # 密度フィルタ半径（格子点数）
 
 alpha_of(rd) = alpha_max * qp * (1 - rd) / (qp + rd)
 dalpha_of(rd) = -alpha_max * qp * (qp + 1) / (qp + rd)^2
 
-"""線形重みの密度フィルタ（FEM のトポ最適と同じもの）。"""
+"""線形重みの密度フィルタ（FEM のトポ最適と同じもの）。
+
+重みも `TW`（Float64）で持つ。`Float32` で正規化すると重みの和が 1 から 1e-7
+ずれ、全部流体（`rd ≡ 1`）でも `rdf` が 1 をまたぐ。
+"""
 function build_filter(ngy, ngx, r)
-    W = Dict{Tuple{Int,Int},Vector{Tuple{Int,Int,T}}}()
+    W = Dict{Tuple{Int,Int},Vector{Tuple{Int,Int,TW}}}()
     for j in 1:ngy, i in 1:ngx
-        lst = Tuple{Int,Int,T}[]
-        s = zero(T)
+        lst = Tuple{Int,Int,TW}[]
+        s = zero(TW)
         for jj in max(1, j - r):min(ngy, j + r), ii in max(1, i - r):min(ngx, i + r)
-            w = T(r + 1) - sqrt(T((ii - i)^2 + (jj - j)^2))
+            w = TW(r + 1) - sqrt(TW((ii - i)^2 + (jj - j)^2))
             if w > 0
                 push!(lst, (jj, ii, w))
                 s += w
@@ -111,23 +123,30 @@ function build_filter(ngy, ngx, r)
 end
 
 apply_filter(W, x) = begin
-    y = similar(x)
+    y = zeros(TW, size(x))
     for j in axes(x, 1), i in axes(x, 2)
-        acc = zero(T)
+        acc = zero(TW)
         for (jj, ii, w) in W[(j, i)]
-            acc += w * x[jj, ii]
+            acc += w * TW(x[jj, ii])
         end
-        y[j, i] = acc
+        # 重みは正規化してあるので数学的には凸結合＝ [0,1] に入る。それでも
+        # clamp するのは、**ここを外すと `α = α_max·q(1-ρ)/(q+ρ)` が負になる**
+        # ——速度を増幅する「負の抗力」になり、しかも大きさが `α_max` に比例する
+        # ——から。Float32 で重みを持っていた頃は全部流体（`rd ≡ 1`）でも
+        # 561 セル中 87 セルで `rdf > 1` になり、5333 ステップで α_max=2e5 なら
+        # 0.19% のエネルギー注入になっていた（出発点の J が α_max 依存でずれ、
+        # 最適化が 1 歩も進まなくなる）。Float64 にした今は保険。
+        y[j, i] = clamp(acc, zero(TW), one(TW))
     end
     y
 end
 
 # フィルタは対称なので転置も同じ重みで書ける
 filter_adjoint(W, g) = begin
-    out = zeros(T, size(g))
+    out = zeros(TW, size(g))
     for j in axes(g, 1), i in axes(g, 2)
         for (jj, ii, w) in W[(j, i)]
-            out[jj, ii] += w * g[j, i]
+            out[jj, ii] += w * TW(g[j, i])
         end
     end
     out
@@ -143,18 +162,18 @@ W = build_filter(p.ngy, p.ngx, filt_r)
 最適化が一切動かなくなる（実際そうなっていた）。
 """
 function project_volume(rd, volfrac)
-    x = clamp.(rd, zero(T), one(T))
+    x = clamp.(rd, zero(TW), one(TW))
     sum(x) / length(x) >= volfrac && return x
-    lo, hi = zero(T), one(T)        # 全部 1 にすれば必ず満たせるので上限は 1
+    lo, hi = zero(TW), one(TW)      # 全部 1 にすれば必ず満たせるので上限は 1
     for _ in 1:60
         mid = (lo + hi) / 2
-        if sum(clamp.(x .+ mid, zero(T), one(T))) / length(x) < volfrac
+        if sum(clamp.(x .+ mid, zero(TW), one(TW))) / length(x) < volfrac
             lo = mid
         else
             hi = mid
         end
     end
-    return clamp.(x .+ (lo + hi) / 2, zero(T), one(T))
+    return clamp.(x .+ (lo + hi) / 2, zero(TW), one(TW))
 end
 
 # ---- 目的関数と勾配 -------------------------------------------------------
@@ -166,8 +185,7 @@ tape = Tape(backend, N, nsteps, p)
 
 function objective_and_grad(rd)
     rdf = apply_filter(W, rd)
-    theta = alpha_of.(rdf)
-    copyto!(th_dev, theta)
+    copyto!(th_dev, T.(alpha_of.(rdf)))   # 設計側は Float64、デバイス側は T
 
     st = State(backend, X0, V0, p)
     reset!(tape)
@@ -185,7 +203,7 @@ end
 """目的関数だけ（前進のみ）。直線探索で候補を試すのに使う。"""
 function objective_only(rd)
     rdf = apply_filter(W, rd)
-    copyto!(th_dev, alpha_of.(rdf))
+    copyto!(th_dev, T.(alpha_of.(rdf)))
     st = State(backend, X0, V0, p)
     simulate!(st, th_dev, p, backend, nsteps)
     J, _ = target_objective(st.X, target[1], target[2], sigma)
@@ -193,7 +211,7 @@ function objective_only(rd)
 end
 
 # ---- 最適化ループ（射影付き勾配法） ---------------------------------------
-rd = fill(T(1.0), p.ngy, p.ngx)   # 全部流体から出発
+rd = fill(TW(1.0), p.ngy, p.ngx)   # 全部流体から出発
 Jhist = T[]
 
 @printf("N = %d 粒子, %d ステップ (%.2f 秒), 設計変数 %d 個\n",
@@ -218,7 +236,7 @@ end
 # 入れ、**改善した候補しか採用しない**ようにする。候補の評価は前進のみで済む。
 println("iter        J        |grad|      step   前進評価")
 
-step_size = T(0.05)
+step_size = TW(0.05)
 J, g = objective_and_grad(rd)
 push!(Jhist, J)
 @printf("%4d  %+.6e  %.3e  %.4f  (初期)\n", 0, J, maximum(abs, g), step_size)
@@ -236,11 +254,11 @@ for it in 1:40
         Jc = objective_only(cand)
         if Jc < J                       # 改善した場合のみ採用（最小化）
             rd, J = cand, Jc
-            step_size = min(step_size * T(1.3), T(0.30))
+            step_size = min(step_size * TW(1.3), TW(0.30))
             accepted = true
             break
         end
-        step_size *= T(0.5)             # 改善しなければ刻みを半分に
+        step_size *= TW(0.5)            # 改善しなければ刻みを半分に
     end
     if !accepted
         @printf("収束（ステップ %.2e まで縮めても改善せず）\n", step_size)
