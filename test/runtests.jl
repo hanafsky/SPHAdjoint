@@ -77,6 +77,14 @@ end
     end
     @test ok
     @test all(nbc .<= st.nl.maxnb)
+
+    # セル内が粒子 id の昇順に整列していること（GPU の総和順序を決定的にする条件）。
+    # CPU では元々ビット再現するのでこのテスト自体は GPU の回帰を直接は捕まえないが、
+    # ソートカーネルが壊れれば落ちる。
+    ordh = Array(st.cl.order)
+    sth = Array(st.cl.starts)
+    cnth = Array(st.cl.counts)
+    @test all(issorted(@view ordh[sth[c]+1:sth[c]+cnth[c]]) for c in eachindex(cnth))
     @test Array(st.nl.flags) == Int32[0, 0]      # 溢れも変位超過も無い
 
     # 密度が総当たりと一致すること（自己項を含む）

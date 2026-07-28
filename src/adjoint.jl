@@ -159,6 +159,13 @@ end
 end
 
 # 設計変数場への書き戻し。ここだけ scatter なのでアトミックを使う。
+#
+# !!! warning "ここだけ決定的でない"
+#     セル内の粒子順序を整列させたので前進（と gX / gV）はビット再現するが、
+#     この浮動小数アトミックだけは加算順序が実行ごとに変わる。実測で gtheta の
+#     絶対差は 7e-12（|gtheta|max ~1e-4 に対し相対 ~1e-7）で Float32 の丸めと
+#     同程度。設計格子は小さい（33x21 程度）ので、完全な決定性が要るなら
+#     galpha を CPU に落として集約する手がある。
 @kernel inbounds = true function adj_design_kernel!(gtheta, gX, @Const(galpha), @Const(X),
                                     @Const(theta), p)
     i = @index(Global)
