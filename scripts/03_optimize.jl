@@ -80,6 +80,15 @@ nsteps = round(Int, t_end / p.dt)
 target = (0.85, 0.10)          # 目標領域の中心
 sigma = 0.10
 
+# 近傍リストの再構築間隔。**既定の 4 はこの設定では長すぎる。**
+# 実測で 1 ステップの最大変位 6.96e-4 に対し許容は `skin·h` = 2.08e-3 なので
+# K ≤ 2。既定のままだと近傍が欠落して勾配がずれ、直線探索が受理しなくなる
+# （`|v|max = 3.28`、`c = 15` に対し `v/c = 0.22` で、既定が想定する `c/10`
+# より速いのが原因）。前進と逆行の両方に同じ値を渡すこと。
+if !@isdefined(NL_INTERVAL)
+    NL_INTERVAL = 2
+end
+
 # ---- 設計変数 -------------------------------------------------------------
 #
 # **設計変数まわりは粒子側の精度（Metal では Float32）と切り離して常に Float64
@@ -92,7 +101,22 @@ const TW = Float64
 # rd ∈ [0,1]:  rd=1 → 流体（α=0）、rd=0 → 固体（α=α_max）
 # Borrvall–Petersson の凸補間:
 #   α(ρ) = α_max · qp (1-ρ) / (qp + ρ)
-alpha_max = TW(2000.0)
+#
+# `α_max` は外から `ALPHA_MAX` で差し替えられる。既定の 2000 は
+# **抗力が陽解法だった頃の値**で、`dt < 2/α_max` の制限（この設定では
+# `α_max < 1.3e4`）に収まるよう選んである。抗力を陰的にした（#4）今は
+# この制限が無い——が、**上げても固体境界はシャープにならない**。
+# むしろ薄くなる（`α_max` が大きいと ρ を 1e-3 下げるだけで必要な抗力が
+# 買えるので、設計を 0/1 に分離する動機が消える）。到達する J も変わらず、
+# 変わるのは収束の速さだけ（2e5 で 5.7 倍）。なお 2e6 まで上げると既定の
+# `STEP0 = 0.05` では初手が受理されない。上げるなら初期幅も一緒に下げること。
+# 既定を 2000 のままにしてあるのは
+# **この設定が一番設計場が見える**から。実測は README の
+# 「α_max を上げても設計はシャープにならない」を参照。
+if !@isdefined(ALPHA_MAX)
+    ALPHA_MAX = 2.0e3
+end
+alpha_max = TW(ALPHA_MAX)
 qp = TW(0.1)
 volfrac = TW(0.75)             # 流体として残す体積割合の下限
 filt_r = 2                     # 密度フィルタ半径（格子点数）
@@ -187,12 +211,13 @@ function objective_and_grad(rd)
     rdf = apply_filter(W, rd)
     copyto!(th_dev, T.(alpha_of.(rdf)))   # 設計側は Float64、デバイス側は T
 
-    st = State(backend, X0, V0, p)
+    st = State(backend, X0, V0, p; interval = NL_INTERVAL)
     reset!(tape)
     simulate!(st, th_dev, p, backend, nsteps; tape)
 
     J, seed = target_objective(st.X, target[1], target[2], sigma)
-    backward!(ws, tape, th_dev, p, backend; seedX = seed, seedV = zero(seed))
+    backward!(ws, tape, th_dev, p, backend; seedX = seed, seedV = zero(seed),
+              interval = NL_INTERVAL)
 
     gtheta = Array(ws.gtheta)
     grdf = gtheta .* dalpha_of.(rdf)         # α(ρ) の連鎖律
@@ -204,7 +229,7 @@ end
 function objective_only(rd)
     rdf = apply_filter(W, rd)
     copyto!(th_dev, T.(alpha_of.(rdf)))
-    st = State(backend, X0, V0, p)
+    st = State(backend, X0, V0, p; interval = NL_INTERVAL)
     simulate!(st, th_dev, p, backend, nsteps)
     J, _ = target_objective(st.X, target[1], target[2], sigma)
     return J
@@ -219,7 +244,7 @@ Jhist = T[]
 
 # 出発点の健全性チェック。目標に水が全く届いていない設定だと勾配が意味を
 # 持たないので、黙って回さずここで気付けるようにしておく。
-let stc = State(backend, X0, V0, p),
+let stc = State(backend, X0, V0, p; interval = NL_INTERVAL),
     thc = KernelAbstractions.zeros(backend, T, p.ngy, p.ngx)
     simulate!(stc, thc, p, backend, nsteps)
     Xh = Array(stc.X)
@@ -236,12 +261,26 @@ end
 # 入れ、**改善した候補しか採用しない**ようにする。候補の評価は前進のみで済む。
 println("iter        J        |grad|      step   前進評価")
 
-step_size = TW(0.05)
+t_start = time()
+# 直線探索の初期ステップ幅。`α_max` を大きく取ると 1 反復目から
+# 「どの向きに動かしても悪化する」ことがあり、そのときは初期幅の問題なのか
+# 出発点（全部流体）が局所最適なのかを切り分けたくなるので外から縮められる。
+if !@isdefined(STEP0)
+    STEP0 = 0.05
+end
+step_size = TW(STEP0)
 J, g = objective_and_grad(rd)
 push!(Jhist, J)
 @printf("%4d  %+.6e  %.3e  %.4f  (初期)\n", 0, J, maximum(abs, g), step_size)
 
-for it in 1:40
+# 反復上限。**条件を比較するときは「上限で打ち切られた」のか「直線探索が
+# 収束した」のかを必ず見分けること。** 上限に張り付いたまま降下し続けている
+# 条件と、収束した条件の J を並べると「まだ伸びしろがある方が悪い」に見える。
+if !@isdefined(MAXIT)
+    MAXIT = 40
+end
+
+for it in 1:MAXIT
     global rd, J, g, step_size
     gn = maximum(abs, g)
     gn < 1e-30 && break
@@ -270,21 +309,58 @@ for it in 1:40
     @printf("%4d  %+.6e  %.3e  %.4f  %d 回\n", it, J, maximum(abs, g), step_size, ntry)
 end
 
+t_elapsed = time() - t_start
+
+# ---- 設計場の離散性 -------------------------------------------------------
+#
+# 「固体境界がシャープか」を数字で見る。Sigmund の非離散性測度
+#
+#     Mnd = (1/n) Σ 4 ρ (1-ρ) × 100 [%]
+#
+# は ρ が 0/1 に張り付くと 0、全部 0.5 だと 100 になる。
+#
+# **フィルタ前 `rd` とフィルタ後 `rdf` の両方を出すこと。** `filt_r = 2` の
+# 線形フィルタは境界に必ず中間値を作るので、`rdf` の Mnd はフィルタの半径に
+# 支配されて `α_max` を変えてもあまり動かない。設計そのものが 0/1 に寄ったか
+# は `rd` 側に出る。
+#
+# `volfrac` は**下限**制約なので、`mean(rd)` がこれに張り付いていなければ
+# 「固体の予算を使い切っていない」＝ 固体にする動機が足りていない、と読める。
+mnd(x) = 100 * sum(4 .* x .* (1 .- x)) / length(x)
+
+let rdf = apply_filter(W, rd)
+    println("\n---- 設計場 ----")
+    @printf("α_max = %.3g   dt·α(ρ=%.2f) = %.3g   dt·α(ρ=0) = %.3g\n",
+            alpha_max, volfrac, p.dt * alpha_of(volfrac), p.dt * alpha_of(zero(TW)))
+    @printf("Mnd(rd)  = %6.2f %%   min %.4f   ρ<0.1 のセル %d / %d\n",
+            mnd(rd), minimum(rd), count(<(TW(0.1)), rd), length(rd))
+    @printf("Mnd(rdf) = %6.2f %%   min %.4f   ρ<0.1 のセル %d / %d\n",
+            mnd(rdf), minimum(rdf), count(<(TW(0.1)), rdf), length(rdf))
+    @printf("mean(rd) = %.4f （体積制約の下限 %.2f）\n", sum(rd) / length(rd), volfrac)
+    @printf("J: %+.6e → %+.6e （%.2f%% 改善）   %d 反復   %.1f 秒\n",
+            Jhist[1], Jhist[end], 100 * (Jhist[1] - Jhist[end]) / abs(Jhist[1]),
+            length(Jhist) - 1, t_elapsed)
+end
+
 # ---- 出力 -----------------------------------------------------------------
-open("design_field.csv", "w") do io
-    println(io, "j,i,rho_design,alpha")
+# 条件を変えて回すときに上書きし合わないよう、`OUT_SUFFIX` で名前を分けられる。
+if !@isdefined(OUT_SUFFIX)
+    OUT_SUFFIX = ""
+end
+open("design_field$(OUT_SUFFIX).csv", "w") do io
+    println(io, "j,i,rho_design,rho_filtered,alpha")
     rdf = apply_filter(W, rd)
     for j in 1:p.ngy, i in 1:p.ngx
-        println(io, j, ",", i, ",", rdf[j, i], ",", alpha_of(rdf[j, i]))
+        println(io, j, ",", i, ",", rd[j, i], ",", rdf[j, i], ",", alpha_of(rdf[j, i]))
     end
 end
-open("objective_history.csv", "w") do io
+open("objective_history$(OUT_SUFFIX).csv", "w") do io
     println(io, "iter,J")
     for (i, J) in enumerate(Jhist)
         println(io, i, ",", J)
     end
 end
-println("\ndesign_field.csv / objective_history.csv を書き出しました")
+println("design_field$(OUT_SUFFIX).csv / objective_history$(OUT_SUFFIX).csv を書き出しました")
 
 # ---- 可視化（GLMakie があれば） -------------------------------------------
 # using GLMakie
