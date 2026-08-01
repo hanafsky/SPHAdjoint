@@ -17,24 +17,14 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      # GLMakie は precompile 時に PrecompileTools のワークロードで実際に OpenGL
-      # ウィンドウを開くため、ヘッドレスの CI では precompile 自体が失敗する:
-      #   GLFWError (FORMAT_UNAVAILABLE): NSGL: Failed to find a suitable pixel format
-      # テストは GLMakie も Metal も using しないので、Pkg の自動 precompile を
-      # 切って「実際に読み込むものだけコンパイルする」ようにする。
-      #
-      # これは対症療法。本来 Metal と GLMakie はオプショナルな依存であり、
-      # [deps] から外すのが筋（issue #13）。
-      JULIA_PKG_PRECOMPILE_AUTO: '0'
     strategy:
       fail-fast: false
       matrix:
-        # macOS ランナーを使う理由: Project.toml の [deps] に macOS 専用の Metal が
-        # 入っているため、Linux では instantiate が通らない。
-        # テスト自体は CPU + Float64 のみで GPU は要らない（GitHub のランナーには
-        # Metal デバイスが無いので、Metal を使う検証はローカル実行のままにする）。
-        os: [macos-latest]
+        # Linux で回せる。本体の [deps] は KernelAbstractions と Atomix だけで、
+        # macOS 専用の Metal も OpenGL を要する GLMakie も入っていない（#13）。
+        # Manifest.toml は gitignore なので CI は Project.toml から解決し直す
+        # ——つまりプラットフォーム依存のものが [deps] に無ければそれで足りる。
+        os: [ubuntu-latest]
         # Project.toml の compat 下限 (1.10) と開発中のバージョン (1.12) を見る
         version: ['1.10', '1.12']
 
@@ -44,19 +34,10 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
-          arch: aarch64
+          arch: x64
 
       - uses: julia-actions/cache@v2
 
       - uses: julia-actions/julia-buildpkg@v1
 
-      # julia-actions/julia-runtest（= Pkg.test()）は使わない。
-      # Pkg.test() はサンドボックスの**直接依存を必ず precompile する**ので、
-      # JULIA_PKG_PRECOMPILE_AUTO=0 でも GLMakie の precompile が走って落ちる。
-      # プロジェクト環境で runtests.jl を直接読めば、実際に using するものしか
-      # コンパイルされない（Test / Random は @stdlib から解決されるので
-      # [extras] のままで足りる）。
-      - name: Run tests
-        run: |
-          julia --project=. --color=yes --check-bounds=yes -e '
-            include("test/runtests.jl")'
+      - uses: julia-actions/julia-runtest@v1
