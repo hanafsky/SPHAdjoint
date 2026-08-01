@@ -3,17 +3,24 @@ uuid = "b780db45-a43e-486a-a2ab-045aa7dbc789"
 version = "0.1.0"
 authors = ["Kei"]
 
+# Metal（macOS 専用）と GLMakie（OpenGL 必須）は **ここに入れない**（#13）。
+# どちらも本体のカーネルからは一切使わず、`scripts/` でしか使わない。
+# [deps] に入れると
+#   1. macOS 専用の Metal のせいで CI が Linux ランナーで instantiate できない
+#   2. GLMakie の precompile がヘッドレスで segfault する（PrecompileTools の
+#      ワークロードが実際に OpenGL ウィンドウを開くため）
+#   3. 他人が Linux / Windows で入れると壊れる
+# という実害が出る。グローバル環境（@v#.#）に置けば、このプロジェクトを
+# activate していても LOAD_PATH 経由で `using` できるので scripts はそのまま動く。
+# 手順は README の「セットアップ」を参照。
+
 [deps]
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
-GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
-Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 
 [compat]
 Atomix = "0.1, 1"
-GLMakie = "0.13.13"
 KernelAbstractions = "0.9"
-Metal = "1.10.0"
 julia = "1.10"
 
 [extras]
