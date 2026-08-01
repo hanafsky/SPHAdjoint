@@ -17,13 +17,28 @@ Apple Silicon / Metal で走る形に置き換えるための最初の一歩。
 `Pkg.add` を一切呼ばない）。プロジェクト直下で `julia` を起動し、`]` を押して：
 
 ```julia-repl
+(@v1.12) pkg> add Metal GLMakie        # ← グローバル環境に入れる（下記）
 (@v1.12) pkg> activate .
-(SPHAdjoint) pkg> instantiate          # KernelAbstractions, Atomix, Metal, GLMakie
-(SPHAdjoint) pkg> add Literate         # ノートを書き出す場合
+(SPHAdjoint) pkg> instantiate          # KernelAbstractions と Atomix だけ
 ```
 
-`Metal`（Apple GPU）と `GLMakie`（可視化 / インタラクティブ版）は `[deps]` に
-入っている。`Literate` はスクリプト側だけで使うので入れていない。
+**本体の依存は `KernelAbstractions` と `Atomix` の 2 つだけ。**
+`Metal`（Apple GPU）も `GLMakie`（可視化 / インタラクティブ版）も
+`scripts/` でしか使わないので `[deps]` には入れていない（#13）。理由：
+
+- **Metal は macOS 専用**なので、`[deps]` に入れると Linux / Windows で
+  `instantiate` が通らなくなる（CI も macOS ランナーに縛られる）
+- **GLMakie はヘッドレスで precompile が segfault する**。PrecompileTools の
+  ワークロードが実際に OpenGL ウィンドウを開くため
+
+グローバル環境（`@v1.12`）に入れておけば、このプロジェクトを activate していても
+`LOAD_PATH` の `@v#.#` 経由で `using Metal` / `using GLMakie` が通る。
+`Literate`（ノート書き出し）も同じ扱いで、必要なときにグローバルへ入れること。
+
+> グローバル環境の Manifest が壊れて `add` できないときは、先に
+> `(@v1.12) pkg> up Qt6Base_jll` を試す（yank されたバージョンが刺さっていると
+> 解決が止まる）。**プロジェクトを activate した状態で叩かないこと**——
+> `Qt6Base_jll` がこのプロジェクトの `[deps]` に入ってしまう。
 
 動作確認：
 
@@ -243,9 +258,10 @@ counting sort のあとで各セルの区間を粒子 id の昇順に整列さ�
      `using SPHAdjoint` すると `Pkg.instantiate()` を要求されて止まる（この
      リポジトリは Pkg 操作をしない方針なのでコピーで回避）。パッケージ本体は
      共有 depot にあるので Manifest さえ置けば解決する
-   - **`JULIA_PKG_PRECOMPILE_AUTO=0` が要る。** `GLMakie` が `[deps]` にある
-     せいでヘッドレスの precompile が **segfault** し、`SPHAdjoint` 自体は
-     precompile 成功しているのに `using` が止まる（#13）
+   - **#13 より前のコミットを取り出すときは `JULIA_PKG_PRECOMPILE_AUTO=0` も要る。**
+     当時は `GLMakie` が `[deps]` に入っており、ヘッドレスの precompile が
+     **segfault** して、`SPHAdjoint` 自体は precompile 成功しているのに
+     `using` が止まる。`07`〜`09` の凍結ヘッダが指しているコミットが該当する
 2. **必ずウォームアップする。** Metal はカーネルの初回コンパイルを含めると
    **1/10** の数字が出る。「GPU が CPU より遅い」と見えたら、まずこれを疑う。
 3. **複数回測って最良値を採る。** 単発の測定は 30% 以上ぶれる。
