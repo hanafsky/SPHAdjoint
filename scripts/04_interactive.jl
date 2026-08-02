@@ -21,7 +21,8 @@
 # 中で回す**こと。GPU コマンドの発行元タスクと GL コンテキストを同じに
 # しておくのが一番安全で、実際これで足りる。
 #
-# `nsub` は `02_dambreak.jl` で測ったステップ/秒から決める。
+# `nsub`（1 フレームあたりの物理ステップ数）は起動時にその場で実測して決める。
+# ハードコードすると CPU/Metal・粒子数を変えたときに合わなくなるため。
 
 using SPHAdjoint
 using KernelAbstractions
@@ -40,11 +41,11 @@ p = SPHParams{T}(
     h = 1.3 * dp, m = dp^2 * 1.0, rho0 = 1.0, c = 15.0, mu = 0.05,
     dt = 2.0e-4, Lx = 1.0, Ly = 0.5, kw = 5.0e4, ngx = 65, ngy = 33,
 )
-alpha_max = T(1500.0)          # 固体セルの抗力係数
-nsub = 20                      # 1 フレームあたりの物理ステップ数
-
-# dt < 2/alpha_max でないと陽的な抗力項が発散する。下のチェックで気づけるように。
-@assert p.dt < 2 / alpha_max "dt が大きすぎます（抗力項が陽解法で不安定）"
+# 固体セルの抗力係数。抗力は陰解法（v' = (v + dt·a_rest)/(1 + dt·α)）なので
+# どれだけ大きくしても発散しない。ただし陽解法より減衰は弱い
+# （1 ステップの減衰率は D = 1/(1+dt·α)。dt=2e-4, α=1500 で D≈0.77）。
+alpha_max = T(1500.0)
+fps_target = 30.0              # nsub 較正の目標フレームレート
 
 # ---- 初期粒子配置 ---------------------------------------------------------
 function initial_particles()
@@ -66,6 +67,34 @@ N = size(X0, 2)
 st = State(backend, X0, V0, p)
 th_dev = KernelAbstractions.allocate(backend, T, p.ngy, p.ngx)
 
+# ---- nsub の較正 ----------------------------------------------------------
+# 起動時に step/s を実測し、目標 fps で割って 1 フレームあたりのステップ数を
+# 決める。較正で状態が進むので、終わったら粒子を初期配置に戻す。
+function calibrate_nsub()
+    fill!(th_dev, T(0))                       # 全部流体で測る
+    for _ in 1:50                             # ウォームアップ（コンパイル込み）
+        step!(st, th_dev, p, backend)
+    end
+    KernelAbstractions.synchronize(backend)
+    nmeas = 400
+    t0 = time_ns()
+    for _ in 1:nmeas
+        step!(st, th_dev, p, backend)
+    end
+    KernelAbstractions.synchronize(backend)
+    sps = nmeas / ((time_ns() - t0) / 1e9)
+    # 描画やイベント処理のぶんを残して 8 割だけ使う。実時間の 1 倍を超えても
+    # 意味がないので、上限は「実時間ちょうど」に当たるステップ数。
+    ns = clamp(round(Int, 0.8 * sps / fps_target),
+               1, max(1, round(Int, 1 / (fps_target * p.dt))))
+    copyto!(st.X, X0)                         # 状態を初期に戻す
+    copyto!(st.V, V0)
+    return ns, sps
+end
+nsub, sps = calibrate_nsub()
+@info "実測 $(round(Int, sps)) step/s → nsub = $nsub " *
+      "(実時間比の上限 ×$(round(nsub * p.dt * fps_target, digits = 2)) @ $(fps_target) fps)"
+
 # ---- 設計場のキャンバス ---------------------------------------------------
 # Makie の heatmap は M[i,j] を (x,y) と解釈するので、キャンバスは (ngx, ngy)。
 # ソルバ側の θ は (ngy, ngx) なので転置して渡す。
@@ -82,7 +111,10 @@ gxs = range(0, p.Lx, length = p.ngx)
 gys = range(0, p.Ly, length = p.ngy)
 
 # ---- 図 -------------------------------------------------------------------
-fig = Figure(size = (1240, 620))
+# Makie の既定フォント（TeX Gyre Heros）は日本語グリフを持たず、ラベルの
+# 描画で error になる（フォールバックも効かない）。macOS 標準のヒラギノを指定。
+fig = Figure(size = (1240, 620),
+             fonts = (; regular = "Hiragino Sans W3", bold = "Hiragino Sans W6"))
 ax = Axis(fig[1, 1], aspect = DataAspect(), limits = (0, p.Lx, 0, p.Ly),
           title = "左ドラッグ=固体を置く / 右ドラッグ=消す")
 
@@ -168,7 +200,7 @@ end
 # ---- メインループ（Makie の tick の中で回す） -----------------------------
 simtime = Ref(0.0)
 
-on(events(fig).tick) do _
+on(events(fig).tick) do tick
     run_toggle.active[] || return
     for _ in 1:nsub
         step!(st, th_dev, p, backend)
@@ -179,25 +211,26 @@ on(events(fig).tick) do _
     Vh = Array(st.V)
     pos_obs[] = Point2f.(Xh[1, :], Xh[2, :])
     spd_obs[] = Float32.(sqrt.(Vh[1, :] .^ 2 .+ Vh[2, :] .^ 2))
-    info_lbl.text[] = "t = $(round(simtime[], digits=3)) s"
+    # fps と実時間比は tick の実測から出す（受け入れ条件の記録用でもある）
+    fps = 1 / max(tick.delta_time, 1e-9)
+    info_lbl.text[] = "t = $(round(simtime[], digits=3)) s   " *
+                      "$(round(Int, fps)) fps   ×$(round(nsub * p.dt * fps, digits=2)) 実時間"
 end
 
-display(fig)
+scr = display(fig)
+
+# GLFW がウィンドウを画面外に置くことがある（外部ディスプレイを外した後に
+# その座標が残っているケースを実測。x=1915 に出て「窓が出ない」ように見えた）。
+# プライマリモニタからはみ出していたら左上に寄せる。
+let glw = scr.glscreen, GLFW = GLMakie.GLFW
+    mode = GLFW.GetVideoMode(GLFW.GetPrimaryMonitor())
+    x, y = GLFW.GetWindowPos(glw)
+    if !(0 <= x < mode.width - 100 && 0 <= y < mode.height - 100)
+        GLFW.SetWindowPos(glw, 80, 60)
+    end
+end
 
 # ---------------------------------------------------------------------------
-# 【推奨する改造: 抗力項を陰的にする】
-#
-# 上の @assert のとおり、陽解法だと dt < 2/α_max の制約がつく。固体を「硬く」
-# したくて α_max を上げると、すぐ発散する。速度更新の抗力部分だけ陰的にすると
-# 無条件安定になり、α_max をいくらでも上げられる:
-#
-#     v' = (v + dt·a_rest) / (1 + dt·α)          a_rest = 抗力以外の加速度
-#
-# 微分も割り算ひとつぶんなので随伴の追加はごく軽い。ただし
-# **現在の随伴は陽解法版で検証済み**なので、変更したら gradcheck.jl を
-# 通し直すこと（src/forward.jl の integrate_kernel! と
-# src/adjoint.jl の抗力項の両方を直す必要がある）。
-#
 # 【発展: 感度場をその場で表示する】
 #
 # 前進だけならテープは要らないが、ここに「感度を見る」ボタンを足すと強力:
