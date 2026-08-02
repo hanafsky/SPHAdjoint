@@ -117,8 +117,26 @@ if !@isdefined(ALPHA_MAX)
     ALPHA_MAX = 2.0e3
 end
 alpha_max = TW(ALPHA_MAX)
-qp = TW(0.1)
-volfrac = TW(0.75)             # 流体として残す体積割合の下限
+#
+# Borrvall–Petersson の罰則 `qp`。**q が大きいほど α(ρ) は線形に近く、
+# 中間密度でも α が大きい**（q → ∞ で α = α_max(1-ρ)）。
+#
+# **真の固体（ρ=0）が欲しければ q を下げる**（実測は README の
+# 「qp を下げると真の固体が出る」）。q を上げる方向は α_max を上げるのと
+# 同型の機構で設計が薄くなる（中間密度で買える抗力が増え、浅掘りで足りる）。
+# q=0.01 で初めて ρ=0 のセルが現れ、J も 4 ポイント良くなる。0.003 は収穫なし。
+# FEM トポ最適の「中間密度を高価にすれば 0/1 に行く」はこの問題では成立しない
+# （体積制約が下限で不活性 = 固体を使わされる圧力が無いから）。
+# `QP` と `RD0` を外から与えれば continuation も組めるが、この問題サイズでは
+# q=0.01 直行と大差なかった（J で 0.3%）。
+if !@isdefined(QP)
+    QP = 0.1
+end
+qp = TW(QP)
+if !@isdefined(VOLFRAC)
+    VOLFRAC = 0.75
+end
+volfrac = TW(VOLFRAC)          # 流体として残す体積割合の下限
 filt_r = 2                     # 密度フィルタ半径（格子点数）
 
 alpha_of(rd) = alpha_max * qp * (1 - rd) / (qp + rd)
@@ -236,7 +254,20 @@ function objective_only(rd)
 end
 
 # ---- 最適化ループ（射影付き勾配法） ---------------------------------------
-rd = fill(TW(1.0), p.ngy, p.ngx)   # 全部流体から出発
+#
+# 初期設計は外から `RD0` で差し替えられる。continuation（qp を段階的に上げ、
+# 前段の解を次段の初期値にする）を外側のループで組むためのもの：
+#
+#     for q in (0.1, 1.0, 10.0)
+#         global QP = q
+#         include("scripts/03_optimize.jl")
+#         global RD0 = rd            # 次段は今段の解から出発
+#     end
+if @isdefined(RD0)
+    rd = copy(RD0)::Matrix{TW}
+else
+    rd = fill(TW(1.0), p.ngy, p.ngx)   # 全部流体から出発
+end
 Jhist = T[]
 
 @printf("N = %d 粒子, %d ステップ (%.2f 秒), 設計変数 %d 個\n",
@@ -330,8 +361,8 @@ mnd(x) = 100 * sum(4 .* x .* (1 .- x)) / length(x)
 
 let rdf = apply_filter(W, rd)
     println("\n---- 設計場 ----")
-    @printf("α_max = %.3g   dt·α(ρ=%.2f) = %.3g   dt·α(ρ=0) = %.3g\n",
-            alpha_max, volfrac, p.dt * alpha_of(volfrac), p.dt * alpha_of(zero(TW)))
+    @printf("α_max = %.3g   qp = %.3g   dt·α(ρ=%.2f) = %.3g   dt·α(ρ=0) = %.3g\n",
+            alpha_max, qp, volfrac, p.dt * alpha_of(volfrac), p.dt * alpha_of(zero(TW)))
     @printf("Mnd(rd)  = %6.2f %%   min %.4f   ρ<0.1 のセル %d / %d\n",
             mnd(rd), minimum(rd), count(<(TW(0.1)), rd), length(rd))
     @printf("Mnd(rdf) = %6.2f %%   min %.4f   ρ<0.1 のセル %d / %d\n",
